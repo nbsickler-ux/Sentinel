@@ -16,6 +16,7 @@
 import express from "express";
 import { paymentMiddlewareFromConfig } from "@x402/express";
 import { HTTPFacilitatorClient } from "@x402/core/server";
+import { createFacilitatorConfig } from "@coinbase/x402";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import { Redis } from "@upstash/redis";
@@ -34,6 +35,9 @@ app.use(express.json());
 const PORT = process.env.PORT || 4021;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 const NETWORK = process.env.NETWORK || "base-sepolia";
+// CDP facilitator for production (Base mainnet); falls back to x402.org for testnet
+const CDP_API_KEY_ID = process.env.CDP_API_KEY_ID || "";
+const CDP_API_KEY_SECRET = process.env.CDP_API_KEY_SECRET || "";
 const FACILITATOR_URL = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 const GOPLUS_API_KEY = process.env.GOPLUS_API_KEY || "";
@@ -1207,7 +1211,11 @@ async function scoreProtocol(contractAddress, chain) {
 // x402 PAYMENT MIDDLEWARE (global)
 // ============================================================
 
-const facilitator = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
+// Use CDP facilitator on mainnet (authenticated, production-grade),
+// fall back to generic URL facilitator on testnet.
+const facilitator = (CDP_API_KEY_ID && CDP_API_KEY_SECRET)
+  ? new HTTPFacilitatorClient(createFacilitatorConfig(CDP_API_KEY_ID, CDP_API_KEY_SECRET))
+  : new HTTPFacilitatorClient({ url: FACILITATOR_URL });
 
 const paymentRoutes = {
   "GET /verify/protocol": {
@@ -1413,7 +1421,15 @@ const schemes = [
   { network: "eip155:8453",  server: new ExactEvmScheme() },  // Base Mainnet
 ];
 
-app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
+// syncFacilitatorOnStart: false — skip startup validation so server boots
+// even if the facilitator hasn't cached this network yet.  The facilitator
+// is still contacted lazily on the first paid request.
+app.use(paymentMiddlewareFromConfig(
+  paymentRoutes, facilitator, schemes,
+  /* paywallConfig */ undefined,
+  /* paywall */       undefined,
+  /* syncFacilitatorOnStart */ false,
+));
 
 
 // ============================================================
@@ -1732,9 +1748,10 @@ app.get("/health", (req, res) => {
   res.json({
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
-    version: "0.2.0",
+    version: "0.3.0",
     status: "operational",
     network: NETWORK,
+    facilitator: (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "cdp (coinbase)" : "x402.org",
     cache: redis ? "enabled" : "disabled",
     rate_limit: ratelimit ? "25 calls/wallet/day free tier" : "disabled",
     endpoints: {
@@ -1875,14 +1892,17 @@ if (NETWORK === "base-sepolia") {
 // START
 // ============================================================
 app.listen(PORT, () => {
+  const facType = (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "CDP (Coinbase)" : "x402.org";
   console.log(`
   ┌────────────────────────────────────────────┐
-  │  SENTINEL v0.1.0                            │
+  │  SENTINEL v0.3.0                            │
   │  The Trust Layer for Autonomous Agents       │
   │  Verify before you execute.                  │
   ├────────────────────────────────────────────┤
-  │  Network:  ${NETWORK.padEnd(33)}│
-  │  Port:     ${String(PORT).padEnd(33)}│
+  │  Network:     ${NETWORK.padEnd(29)}│
+  │  Facilitator: ${facType.padEnd(29)}│
+  │  Port:        ${String(PORT).padEnd(29)}│
+  │  Cache:       ${(redis ? "enabled" : "disabled").padEnd(29)}│
   ├────────────────────────────────────────────┤
   │  LIVE:                                       │
   │    GET /verify/protocol  ($0.008 USDC)       │
