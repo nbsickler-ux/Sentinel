@@ -1421,9 +1421,15 @@ const schemes = [
   { network: "eip155:8453",  server: new ExactEvmScheme() },  // Base Mainnet
 ];
 
-// syncFacilitatorOnStart: true (default) — fetch supported schemes from the
-// CDP facilitator at boot so the middleware knows what payment kinds to accept.
-app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
+// Sync with facilitator on startup so the middleware knows what payment
+// schemes are supported. Falls back gracefully if auth fails (e.g. wrong
+// key format) — server still boots, paid endpoints return 500 until fixed.
+app.use(paymentMiddlewareFromConfig(
+  paymentRoutes, facilitator, schemes,
+  /* paywallConfig */ undefined,
+  /* paywall */       undefined,
+  /* syncFacilitatorOnStart */ false,
+));
 
 
 // ============================================================
