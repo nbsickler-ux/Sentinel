@@ -1898,6 +1898,7 @@ app.get("/openapi.json", (req, res) => {
       "x-payment-protocol": "x402",
       "x-payment-token": "USDC",
       "x-payment-network": "Base (eip155:8453)",
+      "x-guidance": "Sentinel verifies on-chain trust for autonomous AI agents on Base. All /verify/* and /preflight endpoints require x402 USDC payment on Base. Free discovery endpoints: GET /, GET /health, GET /openapi.json.",
     },
     servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
     paths: {
@@ -1923,7 +1924,7 @@ app.get("/openapi.json", (req, res) => {
           summary: "Assess smart contract trustworthiness",
           description: "Evaluates a smart contract's audit status, TVL, on-chain age, open-source verification, and protocol registry presence. Returns a composite trust score with verdict and grade.",
           tags: ["Verification"],
-          "x-price": "$0.008 USDC",
+          "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.008", currency: "USDC", network: "eip155:8453" },
           parameters: [
             { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Contract address to verify" },
             { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
@@ -1942,7 +1943,7 @@ app.get("/openapi.json", (req, res) => {
           summary: "Check token legitimacy and safety",
           description: "Detects honeypots, fake tokens, tax manipulation, rugpull patterns, and ownership risks. Uses GoPlus Security API for comprehensive token analysis.",
           tags: ["Verification"],
-          "x-price": "$0.005 USDC",
+          "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.005", currency: "USDC", network: "eip155:8453" },
           parameters: [
             { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Token contract address" },
             { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
@@ -1961,7 +1962,7 @@ app.get("/openapi.json", (req, res) => {
           summary: "Analyze DeFi position risk",
           description: "Evaluates liquidity depth, impermanent loss risk, pool concentration, and utilization rate for DeFi positions.",
           tags: ["Verification"],
-          "x-price": "$0.005 USDC",
+          "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.005", currency: "USDC", network: "eip155:8453" },
           parameters: [
             { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Pool or vault contract address" },
             { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
@@ -1980,7 +1981,7 @@ app.get("/openapi.json", (req, res) => {
           summary: "Assess counterparty wallet safety",
           description: "Checks OFAC sanctions list, contract verification status, wallet age, transaction patterns, and activity signals. OFAC hits are hard blockers that override all other scores.",
           tags: ["Verification"],
-          "x-price": "$0.010 USDC",
+          "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.010", currency: "USDC", network: "eip155:8453" },
           parameters: [
             { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Wallet or contract address" },
             { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
@@ -1999,7 +2000,7 @@ app.get("/openapi.json", (req, res) => {
           summary: "Unified pre-transaction safety check",
           description: "Runs protocol, token, position, and counterparty checks in parallel. Computes a weighted composite score (protocol 35%, position 25%, token 20%, counterparty 20%) with dynamic normalization for missing checks. OFAC sanctions and honeypot detections are hard blockers. Returns a single proceed/do-not-proceed recommendation.",
           tags: ["Verification"],
-          "x-price": "$0.025 USDC",
+          "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.025", currency: "USDC", network: "eip155:8453" },
           parameters: [
             { name: "target", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Target contract address for the transaction" },
             { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
