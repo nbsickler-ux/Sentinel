@@ -1298,7 +1298,7 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Protocol Verification - trust assessment for any smart contract",
-    ...declareDiscoveryExtension({
+    extensions: declareDiscoveryExtension({
       input: { address: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
       inputSchema: {
         properties: {
@@ -1337,7 +1337,7 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Token Verification - honeypot detection, tax analysis, ownership risks",
-    ...declareDiscoveryExtension({
+    extensions: declareDiscoveryExtension({
       input: { address: "0x532f27101965dd16442E59d40670FaF5eBB142E4", chain: "base" },
       inputSchema: {
         properties: {
@@ -1378,7 +1378,7 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Position Analysis - DeFi position risk assessment with protocol trust scoring",
-    ...declareDiscoveryExtension({
+    extensions: declareDiscoveryExtension({
       input: { protocol: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
       inputSchema: {
         properties: {
@@ -1416,7 +1416,7 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Counterparty Intelligence - OFAC sanctions screening, address reputation, exploit association",
-    ...declareDiscoveryExtension({
+    extensions: declareDiscoveryExtension({
       input: { address: "0x1234567890abcdef1234567890abcdef12345678", chain: "base" },
       inputSchema: {
         properties: {
@@ -1453,7 +1453,7 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Preflight Check - unified pre-transaction safety analysis combining protocol trust, token safety, counterparty screening, and position risk in one call",
-    ...declareDiscoveryExtension({
+    extensions: declareDiscoveryExtension({
       input: { target: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
       inputSchema: {
         properties: {
@@ -1888,6 +1888,41 @@ app.get("/", (req, res) => {
       step_4: "Receive the trust verification result",
       example: 'POST /verify/protocol { "address": "0x2626664c2603336e57b271c5c0b26f421741e481", "chain": "base" }',
     },
+  });
+});
+
+// /.well-known/x402 — discovery document for x402scan and agent frameworks
+app.get("/.well-known/x402", (req, res) => {
+  const BASE = "https://sentinel-awms.onrender.com";
+  res.json({
+    version: 1,
+    description: "Sentinel — x402-gated on-chain trust verification for autonomous AI agents on Base. Pay per query in USDC, no API keys required.",
+    resources: [
+      `${BASE}/verify/protocol`,
+      `${BASE}/verify/token`,
+      `${BASE}/verify/position`,
+      `${BASE}/verify/counterparty`,
+      `${BASE}/preflight`,
+    ],
+    instructions: [
+      "# Sentinel API",
+      "All endpoints accept POST with JSON body. Payment via x402 on Base (eip155:8453) in USDC.",
+      "",
+      "## POST /verify/protocol",
+      "Assess smart contract trustworthiness. Input: { address (required), chain, detail }. Price: $0.008 USDC.",
+      "",
+      "## POST /verify/token",
+      "Check token legitimacy and safety. Input: { address (required), chain, detail }. Price: $0.005 USDC.",
+      "",
+      "## POST /verify/position",
+      "Analyze DeFi position risk. Input: { address (required), chain, detail }. Price: $0.005 USDC.",
+      "",
+      "## POST /verify/counterparty",
+      "Assess counterparty wallet safety. Input: { address (required), chain, detail }. Price: $0.010 USDC.",
+      "",
+      "## POST /preflight",
+      "Unified pre-transaction safety check. Input: { target (required), chain, token, counterparty, detail }. Price: $0.025 USDC.",
+    ].join("\n"),
   });
 });
 
