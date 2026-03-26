@@ -1290,7 +1290,7 @@ const facilitator = (CDP_API_KEY_ID && CDP_API_KEY_SECRET)
   : new HTTPFacilitatorClient({ url: FACILITATOR_URL });
 
 const paymentRoutes = {
-  "GET /verify/protocol": {
+  "POST /verify/protocol": {
     accepts: {
       scheme: "exact",
       price: PRICE.verifyProtocol,
@@ -1329,7 +1329,7 @@ const paymentRoutes = {
       },
     }),
   },
-  "GET /verify/token": {
+  "POST /verify/token": {
     accepts: {
       scheme: "exact",
       price: PRICE.verifyToken,
@@ -1370,7 +1370,7 @@ const paymentRoutes = {
       },
     }),
   },
-  "GET /verify/position": {
+  "POST /verify/position": {
     accepts: {
       scheme: "exact",
       price: PRICE.verifyPosition,
@@ -1408,7 +1408,7 @@ const paymentRoutes = {
       },
     }),
   },
-  "GET /verify/counterparty": {
+  "POST /verify/counterparty": {
     accepts: {
       scheme: "exact",
       price: PRICE.verifyCounterparty,
@@ -1445,7 +1445,7 @@ const paymentRoutes = {
       },
     }),
   },
-  "GET /preflight": {
+  "POST /preflight": {
     accepts: {
       scheme: "exact",
       price: PRICE.preflight,
@@ -1546,8 +1546,9 @@ app.use(PAID_PATHS, async (req, res, next) => {
  * /verify/protocol - $0.008 per call
  * The highest-value endpoint: answers "is this contract safe to interact with?"
  */
-app.get("/verify/protocol", async (req, res) => {
-  const { address, chain = "base", detail = "full" } = req.query;
+app.post("/verify/protocol", async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({ error: "Valid contract address required (0x + 40 hex characters)" });
@@ -1569,8 +1570,9 @@ app.get("/verify/protocol", async (req, res) => {
  * /verify/position - $0.005 per call
  * DeFi position risk analysis: protocol trust + category risk + TVL health + concentration
  */
-app.get("/verify/position", async (req, res) => {
-  const { protocol: protocolAddress, user, chain = "base", detail = "full" } = req.query;
+app.post("/verify/position", async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  const { protocol: protocolAddress, user, chain = "base", detail = "full" } = params;
 
   if (!protocolAddress || !/^0x[a-fA-F0-9]{40}$/.test(protocolAddress)) {
     return res.status(400).json({ error: "Valid protocol contract address required (?protocol=0x...)" });
@@ -1592,8 +1594,9 @@ app.get("/verify/position", async (req, res) => {
  * /verify/counterparty - $0.01 per call
  * Counterparty intelligence: OFAC sanctions, address reputation, exploit association
  */
-app.get("/verify/counterparty", async (req, res) => {
-  const { address, chain = "base", detail = "full" } = req.query;
+app.post("/verify/counterparty", async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({ error: "Valid address required (0x + 40 hex characters)" });
@@ -1613,8 +1616,9 @@ app.get("/verify/counterparty", async (req, res) => {
  * /verify/token - $0.005 per call
  * Token safety assessment: honeypot, tax, ownership, holder distribution
  */
-app.get("/verify/token", async (req, res) => {
-  const { address, chain = "base", detail = "full" } = req.query;
+app.post("/verify/token", async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({ error: "Valid token address required (0x + 40 hex characters)" });
@@ -1681,8 +1685,9 @@ app.get("/verify/token", async (req, res) => {
  * Runs protocol trust + token safety + counterparty screening + position risk in parallel
  * Returns a single go/no-go verdict with component grades
  */
-app.get("/preflight", async (req, res) => {
-  const { target, token, counterparty, chain = "base", detail = "full" } = req.query;
+app.post("/preflight", async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  const { target, token, counterparty, chain = "base", detail = "full" } = params;
 
   if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
     return res.status(400).json({ error: "Valid target address required (?target=0x... — the contract you're about to interact with)" });
@@ -1868,20 +1873,20 @@ app.get("/", (req, res) => {
       integration_guide: "https://github.com/nbsickler-ux/Sentinel/blob/main/INTEGRATION.md",
     },
     endpoints: [
-      { path: "GET /verify/protocol",     price: "$0.008 USDC", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
-      { path: "GET /verify/token",         price: "$0.005 USDC", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
-      { path: "GET /verify/position",      price: "$0.005 USDC", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
-      { path: "GET /verify/counterparty",  price: "$0.010 USDC", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
-      { path: "GET /preflight",            price: "$0.025 USDC", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
+      { path: "POST /verify/protocol",     price: "$0.008 USDC", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
+      { path: "POST /verify/token",         price: "$0.005 USDC", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
+      { path: "POST /verify/position",      price: "$0.005 USDC", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
+      { path: "POST /verify/counterparty",  price: "$0.010 USDC", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
+      { path: "POST /preflight",            price: "$0.025 USDC", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
     ],
     trust_verdicts: ["SAFE", "MODERATE", "CAUTION", "DANGER"],
     grades: ["A+", "A", "B+", "B", "C+", "C", "D", "F"],
     quick_start: {
-      step_1: "Send a GET request to any endpoint above",
+      step_1: "Send a POST request with JSON body to any endpoint above",
       step_2: "Receive HTTP 402 with x402 payment details",
       step_3: "Sign a USDC payment on Base and include the x402 header",
       step_4: "Receive the trust verification result",
-      example: "GET /verify/protocol?address=0x2626664c2603336e57b271c5c0b26f421741e481&chain=base",
+      example: 'POST /verify/protocol { "address": "0x2626664c2603336e57b271c5c0b26f421741e481", "chain": "base" }',
     },
   });
 });
@@ -1903,17 +1908,28 @@ app.get("/openapi.json", (req, res) => {
     servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
     paths: {
       "/verify/protocol": {
-        get: {
+        post: {
           operationId: "verifyProtocol",
           summary: "Assess smart contract trustworthiness",
           description: "Evaluates a smart contract's audit status, TVL, on-chain age, open-source verification, and protocol registry presence. Returns a composite trust score with verdict and grade.",
           tags: ["Verification"],
           "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.008", currency: "USDC", network: "eip155:8453" },
-          parameters: [
-            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Contract address to verify" },
-            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
-            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
-          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["address"],
+                  properties: {
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Contract address to verify" },
+                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
+                  },
+                },
+              },
+            },
+          },
           responses: {
             "200": { description: "Trust verification result with score, verdict, grade, and evidence" },
             "402": { description: "Payment required — x402 payment details in response headers" },
@@ -1922,17 +1938,28 @@ app.get("/openapi.json", (req, res) => {
         },
       },
       "/verify/token": {
-        get: {
+        post: {
           operationId: "verifyToken",
           summary: "Check token legitimacy and safety",
           description: "Detects honeypots, fake tokens, tax manipulation, rugpull patterns, and ownership risks. Uses GoPlus Security API for comprehensive token analysis.",
           tags: ["Verification"],
           "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.005", currency: "USDC", network: "eip155:8453" },
-          parameters: [
-            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Token contract address" },
-            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
-            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
-          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["address"],
+                  properties: {
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Token contract address" },
+                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
+                  },
+                },
+              },
+            },
+          },
           responses: {
             "200": { description: "Token safety result with honeypot detection, tax analysis, and risk flags" },
             "402": { description: "Payment required" },
@@ -1941,17 +1968,28 @@ app.get("/openapi.json", (req, res) => {
         },
       },
       "/verify/position": {
-        get: {
+        post: {
           operationId: "verifyPosition",
           summary: "Analyze DeFi position risk",
           description: "Evaluates liquidity depth, impermanent loss risk, pool concentration, and utilization rate for DeFi positions.",
           tags: ["Verification"],
           "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.005", currency: "USDC", network: "eip155:8453" },
-          parameters: [
-            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Pool or vault contract address" },
-            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
-            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
-          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["address"],
+                  properties: {
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Pool or vault contract address" },
+                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
+                  },
+                },
+              },
+            },
+          },
           responses: {
             "200": { description: "Position risk analysis with liquidity and concentration metrics" },
             "402": { description: "Payment required" },
@@ -1960,17 +1998,28 @@ app.get("/openapi.json", (req, res) => {
         },
       },
       "/verify/counterparty": {
-        get: {
+        post: {
           operationId: "verifyCounterparty",
           summary: "Assess counterparty wallet safety",
           description: "Checks OFAC sanctions list, contract verification status, wallet age, transaction patterns, and activity signals. OFAC hits are hard blockers that override all other scores.",
           tags: ["Verification"],
           "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.010", currency: "USDC", network: "eip155:8453" },
-          parameters: [
-            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Wallet or contract address" },
-            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
-            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
-          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["address"],
+                  properties: {
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Wallet or contract address" },
+                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
+                  },
+                },
+              },
+            },
+          },
           responses: {
             "200": { description: "Counterparty intelligence with sanctions check and activity analysis" },
             "402": { description: "Payment required" },
@@ -1979,19 +2028,30 @@ app.get("/openapi.json", (req, res) => {
         },
       },
       "/preflight": {
-        get: {
+        post: {
           operationId: "preflight",
           summary: "Unified pre-transaction safety check",
           description: "Runs protocol, token, position, and counterparty checks in parallel. Computes a weighted composite score (protocol 35%, position 25%, token 20%, counterparty 20%) with dynamic normalization for missing checks. OFAC sanctions and honeypot detections are hard blockers. Returns a single proceed/do-not-proceed recommendation.",
           tags: ["Verification"],
           "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: "0.025", currency: "USDC", network: "eip155:8453" },
-          parameters: [
-            { name: "target", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Target contract address for the transaction" },
-            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
-            { name: "token", in: "query", required: false, schema: { type: "string" }, description: "Token address involved (optional)" },
-            { name: "counterparty", in: "query", required: false, schema: { type: "string" }, description: "Counterparty wallet address (optional)" },
-            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
-          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["target"],
+                  properties: {
+                    target: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Target contract address for the transaction" },
+                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    token: { type: "string", description: "Token address involved (optional)" },
+                    counterparty: { type: "string", description: "Counterparty wallet address (optional)" },
+                    detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
+                  },
+                },
+              },
+            },
+          },
           responses: {
             "200": { description: "Composite safety analysis with proceed recommendation, individual component scores, and hard-blocker flags" },
             "402": { description: "Payment required" },
