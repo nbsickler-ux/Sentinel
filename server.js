@@ -1421,15 +1421,9 @@ const schemes = [
   { network: "eip155:8453",  server: new ExactEvmScheme() },  // Base Mainnet
 ];
 
-// syncFacilitatorOnStart: false — skip startup validation so server boots
-// even if the facilitator hasn't cached this network yet.  The facilitator
-// is still contacted lazily on the first paid request.
-app.use(paymentMiddlewareFromConfig(
-  paymentRoutes, facilitator, schemes,
-  /* paywallConfig */ undefined,
-  /* paywall */       undefined,
-  /* syncFacilitatorOnStart */ false,
-));
+// syncFacilitatorOnStart: true (default) — fetch supported schemes from the
+// CDP facilitator at boot so the middleware knows what payment kinds to accept.
+app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
 
 
 // ============================================================
