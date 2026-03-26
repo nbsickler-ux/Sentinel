@@ -1,6 +1,6 @@
 # Sentinel — Project Status
 
-**Last Updated:** March 25, 2026 (Phase 2 build)
+**Last Updated:** March 25, 2026 (Phase 3 complete — all 5 endpoints live)
 
 ---
 
@@ -67,6 +67,26 @@ The server is deployed on Render with a working x402 payment wall and live data 
 | TVL health | 20% | DeFiLlama live TVL + 30d trend |
 | Concentration risk | 20% | Structural assessment from TVL depth |
 
+### Counterparty Risk Score (4 dimensions)
+
+| Dimension | Weight | Data Source |
+|-----------|--------|-------------|
+| Sanctions screening | 40% | OFAC SDN list (87 ETH addresses, daily-updated from GitHub) |
+| Address reputation | 30% | GoPlus address security API (malicious, phishing, cybercrime, mixer) |
+| Exploit association | 20% | DeFiLlama protocol registry (hacked flag) |
+| Address type | 10% | GoPlus (contract vs. EOA classification) |
+
+### Preflight Composite Score (dynamic weighting)
+
+| Component | Weight | Source |
+|-----------|--------|--------|
+| Protocol trust | 35% | `/verify/protocol` scoring engine |
+| Position risk | 25% | `/verify/position` scoring engine |
+| Token safety | 20% | `/verify/token` scoring engine (if token provided) |
+| Counterparty risk | 20% | `/verify/counterparty` scoring engine (if counterparty provided) |
+
+*Weights normalize to 100% based on which checks run. Hard blockers (OFAC sanctions, honeypots) override to DANGER/F regardless of composite.*
+
 Grades: A (85+) / B (70-84) / C (55-69) / D (40-54) / F (0-39)
 Verdicts: SAFE / LOW_RISK / CAUTION / HIGH_RISK / DANGER
 
@@ -79,8 +99,8 @@ Verdicts: SAFE / LOW_RISK / CAUTION / HIGH_RISK / DANGER
 | `GET /verify/protocol?address=0x...` | $0.008 | Live | Full protocol trust assessment |
 | `GET /verify/token?address=0x...` | $0.005 | Live | Token safety: honeypot, tax, ownership, holders |
 | `GET /verify/position?protocol=0x...` | $0.005 | Live | Position risk: protocol trust + category + TVL + concentration |
-| `GET /verify/counterparty` | $0.01 | 501 stub — Phase 3 | Sanctions screening, reputation |
-| `GET /preflight` | $0.025 | 501 stub — Phase 4 | Unified pre-transaction check |
+| `GET /verify/counterparty` | $0.01 | Live | OFAC sanctions screening, address reputation, exploit association |
+| `GET /preflight` | $0.025 | Live | Unified pre-transaction check (protocol + token + counterparty + position) |
 | `GET /health` | Free | Live | Server status + endpoint catalog |
 
 ### Response Detail Levels
@@ -153,24 +173,28 @@ All paid endpoints accept a `?detail=` parameter:
 - [x] Dev test routes added (`/test/protocol`, `/test/token`, `/test/position`) — active only on base-sepolia
 - [x] GitHub private repo created (nbsickler-ux/Sentinel)
 - [x] Deployed to Render — public URL live, health check confirmed, 402 paywall verified
+- [x] Bazaar discovery extensions deployed — agents can discover Sentinel via x402 facilitator
+- [x] `/verify/counterparty` — 4-dimension counterparty scoring (sanctions 40%, reputation 30%, exploit 20%, type 10%)
+- [x] OFAC SDN sanctions screening — 87 ETH addresses indexed from daily-updated GitHub list with fallback source
+- [x] GoPlus address security integration — malicious, phishing, cybercrime, money laundering, darkweb, mixer detection
+- [x] Exploit association checking against DeFiLlama protocol registry
+- [x] Counterparty tested with known Tornado Cash sanctioned address — DANGER/F/34 confirmed
+- [x] `/preflight` — unified pre-transaction safety check combining protocol + token + counterparty + position
+- [x] Preflight hard blockers: OFAC sanctions and honeypot override composite score to DANGER/F
+- [x] Preflight proceed/no-go recommendation with risk flag aggregation
+- [x] Bazaar discovery extensions on all 5 paid endpoints
+- [x] Dev test route `/test/preflight` added
 
 ## What's Next
 
 ### Immediate
+- [ ] Push Phase 3 changes to GitHub → Render auto-deploy
 - [ ] End-to-end paid verification test with a funded Sepolia wallet
 
-### Phase 3 — Discovery & Mainnet
-- [x] Deployed to Render (https://sentinel-awms.onrender.com)
-- [ ] Register on the Bazaar so agents can discover Sentinel
-- [ ] Switch default `detail` level to `standard` for production
-
-### Phase 3 — Counterparty Endpoint
-- [ ] `/verify/counterparty` — OFAC sanctions screening via SDN list download + indexing
-
 ### Phase 4 — Production Hardening
+- [ ] Switch default `detail` level to `standard` for production
 - [ ] Upstash Redis caching layer (5-15 min TTL)
 - [ ] Rate limiting (25 free calls/wallet/day)
-- [ ] `/preflight` — unified pre-transaction check combining protocol + token + position
 - [ ] Switch to Base Mainnet + production facilitator
 - [ ] Write integration guide for agent builders
 
@@ -191,6 +215,7 @@ All paid endpoints accept a `?detail=` parameter:
 ## Known Issues
 
 - DeFiLlama hacks endpoint is Pro-only; using the free protocol `hacked` flag instead (less granular)
-- `/verify/counterparty` and `/preflight` still return 501 Not Implemented
 - Governance and community dimensions in protocol scoring use placeholder values (65 and 60)
 - Position analysis doesn't yet have on-chain position data (no liquidation proximity or IL calculation) — uses structural assessment
+- OFAC sanctions list covers 87 ETH addresses; does not yet cover BTC or other chains
+- No caching layer yet — each request hits external APIs fresh (will be addressed with Upstash Redis in Phase 4)

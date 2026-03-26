@@ -10,6 +10,7 @@
 //
 // Phase 1: /verify/protocol endpoint on Base Sepolia testnet
 // Phase 2: /verify/token + /verify/position endpoints
+// Phase 3: /verify/counterparty + /preflight unified check
 // ============================================================
 
 import express from "express";
@@ -752,6 +753,252 @@ function generatePositionRecommendations(riskFlags, score) {
 
 
 // ============================================================
+// COUNTERPARTY DATA LAYER
+// OFAC sanctions screening + address reputation
+// ============================================================
+
+// --- OFAC SDN Sanctioned Addresses (loaded on startup) ---
+let sanctionedAddresses = new Set();
+let sanctionsLoaded = false;
+
+async function loadSanctionedAddresses() {
+  try {
+    console.log("  Loading OFAC sanctioned addresses...");
+    // Primary: 0xB10C's daily-updated list from OFAC SDN
+    const response = await axios.get(
+      "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt",
+      { timeout: 10000 }
+    );
+    const addresses = response.data
+      .split("\n")
+      .map(line => line.trim().toLowerCase())
+      .filter(line => line.startsWith("0x") && line.length === 42);
+
+    for (const addr of addresses) {
+      sanctionedAddresses.add(addr);
+    }
+    sanctionsLoaded = true;
+    console.log(`  OFAC sanctions list loaded: ${sanctionedAddresses.size} ETH addresses indexed`);
+  } catch (e) {
+    console.error("  Failed to load OFAC sanctions list:", e.message);
+    // Try fallback source
+    try {
+      const fallback = await axios.get(
+        "https://raw.githubusercontent.com/ultrasoundmoney/ofac-ethereum-addresses/main/data.csv",
+        { timeout: 10000 }
+      );
+      const lines = fallback.data.split("\n").slice(1); // Skip CSV header
+      for (const line of lines) {
+        const addr = line.split(",")[0]?.trim().toLowerCase();
+        if (addr && addr.startsWith("0x") && addr.length === 42) {
+          sanctionedAddresses.add(addr);
+        }
+      }
+      sanctionsLoaded = true;
+      console.log(`  OFAC sanctions list loaded (fallback): ${sanctionedAddresses.size} ETH addresses`);
+    } catch (e2) {
+      console.error("  Fallback sanctions list also failed:", e2.message);
+    }
+  }
+}
+
+// Load sanctions list on startup (non-blocking)
+loadSanctionedAddresses();
+
+/**
+ * Check if an address is on the OFAC sanctions list
+ */
+function checkSanctions(address) {
+  const normalized = address.toLowerCase();
+  const isSanctioned = sanctionedAddresses.has(normalized);
+  return {
+    sanctioned: isSanctioned,
+    list: isSanctioned ? "OFAC SDN" : null,
+    list_loaded: sanctionsLoaded,
+    addresses_indexed: sanctionedAddresses.size,
+  };
+}
+
+/**
+ * Get address security data from GoPlus
+ * Checks: malicious address, phishing, contract risk
+ */
+async function getAddressSecurity(address, chain) {
+  const normalized = address.toLowerCase();
+  const chainId = chain === "base" ? "8453" : "84532";
+
+  try {
+    const response = await goplusGet(
+      `https://api.gopluslabs.io/api/v1/address_security/${normalized}?chain_id=${chainId}`
+    );
+    const data = response.data?.result;
+    if (!data) {
+      return { available: false, source: "goplus_no_data" };
+    }
+
+    return {
+      available: true,
+      source: "goplus",
+      is_malicious_address: data.malicious_address === "1",
+      is_phishing: data.phishing_activities === "1",
+      is_blacklisted: data.blacklist_doubt === "1",
+      is_contract: data.contract_address === "1",
+      is_mixer: data.mixer === "1",
+      is_cybercrime: data.cybercrime === "1",
+      is_money_laundering: data.money_laundering === "1",
+      is_financial_crime: data.financial_crime === "1",
+      is_darkweb: data.darkweb_transactions === "1",
+      is_sanctioned: data.sanctioned === "1",
+      data_source: data.data_source || null,
+    };
+  } catch (e) {
+    return { available: false, source: "goplus_error", error: e.message };
+  }
+}
+
+/**
+ * Check if an address has exploit history in our protocol registry
+ */
+function checkExploitAssociation(address) {
+  const normalized = address.toLowerCase();
+  const protocol = protocolRegistry[normalized];
+  if (protocol && protocol.hacked) {
+    return {
+      associated: true,
+      protocol_name: protocol.name,
+      hack_date: protocol.hackDate,
+      hack_amount: protocol.hackAmount,
+    };
+  }
+  return { associated: false };
+}
+
+/**
+ * Score a counterparty address across risk dimensions
+ */
+async function scoreCounterparty(address, chain) {
+  const startTime = Date.now();
+  const dimensions = {};
+  const riskFlags = [];
+
+  // Fetch all data in parallel
+  const [sanctions, addressSecurity, exploitAssoc] = await Promise.all([
+    Promise.resolve(checkSanctions(address)),
+    getAddressSecurity(address, chain),
+    Promise.resolve(checkExploitAssociation(address)),
+  ]);
+
+  // 1. Sanctions Screening (40%)
+  let sanctionsScore = 95;
+  if (sanctions.sanctioned) {
+    sanctionsScore = 0;
+    riskFlags.push("ADDRESS IS ON OFAC SDN SANCTIONS LIST - DO NOT INTERACT");
+  }
+  if (addressSecurity.available && addressSecurity.is_sanctioned) {
+    sanctionsScore = 0;
+    riskFlags.push("Address flagged as sanctioned by GoPlus");
+  }
+  if (!sanctions.list_loaded) {
+    sanctionsScore = 50;
+    riskFlags.push("Sanctions list not loaded - screening incomplete");
+  }
+  dimensions.sanctions_screening = {
+    score: sanctionsScore,
+    detail: sanctions.sanctioned
+      ? `SANCTIONED on ${sanctions.list}`
+      : `Not found on OFAC SDN list (${sanctions.addresses_indexed} addresses screened)`,
+  };
+
+  // 2. Address Reputation (30%)
+  let reputationScore = 80;
+  if (addressSecurity.available) {
+    if (addressSecurity.is_malicious_address) { reputationScore = 5; riskFlags.push("Flagged as malicious address"); }
+    if (addressSecurity.is_phishing) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with phishing activities"); }
+    if (addressSecurity.is_cybercrime) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with cybercrime"); }
+    if (addressSecurity.is_money_laundering) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with money laundering"); }
+    if (addressSecurity.is_darkweb) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with darkweb transactions"); }
+    if (addressSecurity.is_financial_crime) { reputationScore = Math.min(reputationScore, 20); riskFlags.push("Associated with financial crime"); }
+    if (addressSecurity.is_mixer) { reputationScore = Math.min(reputationScore, 30); riskFlags.push("Associated with mixer/tumbler usage"); }
+    if (addressSecurity.is_blacklisted) { reputationScore = Math.min(reputationScore, 25); riskFlags.push("Address is on blacklist"); }
+  } else {
+    reputationScore = 60; // Unknown = moderate risk
+  }
+  dimensions.address_reputation = {
+    score: reputationScore,
+    detail: addressSecurity.available
+      ? (reputationScore >= 70 ? "No negative reputation signals detected" : "Negative reputation signals detected")
+      : "Address reputation data unavailable",
+  };
+
+  // 3. Exploit Association (20%)
+  let exploitScore = 90;
+  if (exploitAssoc.associated) {
+    exploitScore = 20;
+    riskFlags.push(`Associated with exploited protocol: ${exploitAssoc.protocol_name} (hacked ${exploitAssoc.hack_date || "date unknown"})`);
+  }
+  dimensions.exploit_association = {
+    score: exploitScore,
+    detail: exploitAssoc.associated
+      ? `Associated with ${exploitAssoc.protocol_name} exploit`
+      : "No exploit associations found",
+  };
+
+  // 4. Address Type (10%)
+  let typeScore = 70;
+  if (addressSecurity.available && addressSecurity.is_contract) {
+    typeScore = 60; // Contracts are slightly riskier as counterparties
+    riskFlags.push("Address is a contract, not an EOA");
+  } else if (addressSecurity.available) {
+    typeScore = 80; // EOA is typical
+  }
+  dimensions.address_type = {
+    score: typeScore,
+    detail: addressSecurity.available
+      ? (addressSecurity.is_contract ? "Contract address" : "Externally owned account (EOA)")
+      : "Address type unknown",
+  };
+
+  // Weighted composite
+  const weights = { sanctions_screening: 0.40, address_reputation: 0.30, exploit_association: 0.20, address_type: 0.10 };
+  const compositeScore = Math.round(
+    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
+  );
+  const { grade, verdict } = gradeFromScore(compositeScore);
+
+  return {
+    address,
+    chain,
+    verdict,
+    trust_grade: grade,
+    trust_score: compositeScore,
+    confidence: sanctions.list_loaded && addressSecurity.available ? 0.90 : 0.55,
+    evidence: {
+      sanctions: {
+        sanctioned: sanctions.sanctioned,
+        list: sanctions.list,
+        addresses_screened: sanctions.addresses_indexed,
+      },
+      reputation: addressSecurity.available ? {
+        is_malicious: addressSecurity.is_malicious_address,
+        is_phishing: addressSecurity.is_phishing,
+        is_mixer: addressSecurity.is_mixer,
+        is_cybercrime: addressSecurity.is_cybercrime,
+        is_money_laundering: addressSecurity.is_money_laundering,
+      } : { available: false },
+      exploit_association: exploitAssoc,
+    },
+    dimensions,
+    risk_flags: riskFlags,
+    meta: {
+      response_time_ms: Date.now() - startTime,
+      data_freshness: new Date().toISOString(),
+      sentinel_version: "0.1.0",
+    },
+  };
+}
+
+
+// ============================================================
 // SCORING ENGINE
 // ============================================================
 
@@ -1008,6 +1255,84 @@ const paymentRoutes = {
       },
     }),
   },
+  "GET /verify/counterparty": {
+    accepts: {
+      scheme: "exact",
+      price: PRICE.verifyCounterparty,
+      network: NETWORK_ID[NETWORK],
+      payTo: WALLET_ADDRESS,
+    },
+    description: "Sentinel Counterparty Intelligence - OFAC sanctions screening, address reputation, exploit association",
+    ...declareDiscoveryExtension({
+      input: { address: "0x1234567890abcdef1234567890abcdef12345678", chain: "base" },
+      inputSchema: {
+        properties: {
+          address: { type: "string", description: "Wallet or contract address to screen (0x + 40 hex chars)" },
+          chain: { type: "string", description: "Chain name: 'base' or 'base-sepolia'", enum: ["base", "base-sepolia"] },
+          detail: { type: "string", description: "Response detail level", enum: ["full", "standard", "minimal"] },
+        },
+        required: ["address"],
+      },
+      output: {
+        example: {
+          address: "0x1234567890abcdef1234567890abcdef12345678",
+          chain: "base",
+          verdict: "SAFE",
+          trust_grade: "A",
+          trust_score: 88,
+          risk_flags: [],
+        },
+        schema: {
+          properties: {
+            verdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"] },
+            trust_grade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+            trust_score: { type: "number" },
+          },
+        },
+      },
+    }),
+  },
+  "GET /preflight": {
+    accepts: {
+      scheme: "exact",
+      price: PRICE.preflight,
+      network: NETWORK_ID[NETWORK],
+      payTo: WALLET_ADDRESS,
+    },
+    description: "Sentinel Preflight Check - unified pre-transaction safety analysis combining protocol trust, token safety, counterparty screening, and position risk in one call",
+    ...declareDiscoveryExtension({
+      input: { target: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      inputSchema: {
+        properties: {
+          target: { type: "string", description: "Primary contract/protocol address for the transaction (0x + 40 hex chars)" },
+          token: { type: "string", description: "Token address involved in the transaction (optional, 0x + 40 hex chars)" },
+          counterparty: { type: "string", description: "Counterparty wallet address (optional, 0x + 40 hex chars)" },
+          chain: { type: "string", description: "Chain name: 'base' or 'base-sepolia'", enum: ["base", "base-sepolia"] },
+          detail: { type: "string", description: "Response detail level", enum: ["full", "standard", "minimal"] },
+        },
+        required: ["target"],
+      },
+      output: {
+        example: {
+          target: "0x2626664c2603336e57b271c5c0b26f421741e481",
+          chain: "base",
+          verdict: "LOW_RISK",
+          trust_grade: "B",
+          composite_score: 74,
+          proceed: true,
+          checks: { protocol: "B", token: null, counterparty: null, position: "C" },
+        },
+        schema: {
+          properties: {
+            verdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"] },
+            trust_grade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+            composite_score: { type: "number" },
+            proceed: { type: "boolean" },
+          },
+        },
+      },
+    }),
+  },
 };
 
 const schemes = [
@@ -1068,14 +1393,22 @@ app.get("/verify/position", async (req, res) => {
 
 /**
  * /verify/counterparty - $0.01 per call
- * Stub for Phase 3
+ * Counterparty intelligence: OFAC sanctions, address reputation, exploit association
  */
-app.get("/verify/counterparty", (req, res) => {
-  res.status(501).json({
-    error: "Coming in Phase 3",
-    description: "Counterparty intelligence - sanctions screening, exploit association, reputation",
-    expected: "May 2026",
-  });
+app.get("/verify/counterparty", async (req, res) => {
+  const { address, chain = "base", detail = "full" } = req.query;
+
+  if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: "Valid address required (0x + 40 hex characters)" });
+  }
+
+  try {
+    const result = await scoreCounterparty(address, chain);
+    res.json(filterResponse(result, DETAIL_LEVELS.includes(detail) ? detail : "full"));
+  } catch (error) {
+    console.error("Counterparty verification error:", error);
+    res.status(500).json({ error: "Counterparty verification failed", detail: error.message });
+  }
 });
 
 /**
@@ -1143,14 +1476,173 @@ app.get("/verify/token", async (req, res) => {
 
 /**
  * /preflight - $0.025 per call
- * Stub for Phase 4
+ * Unified pre-transaction safety check
+ * Runs protocol trust + token safety + counterparty screening + position risk in parallel
+ * Returns a single go/no-go verdict with component grades
  */
-app.get("/preflight", (req, res) => {
-  res.status(501).json({
-    error: "Coming in Phase 4",
-    description: "Unified pre-transaction safety check - protocol + counterparty + position in one call",
-    expected: "June 2026",
-  });
+app.get("/preflight", async (req, res) => {
+  const { target, token, counterparty, chain = "base", detail = "full" } = req.query;
+
+  if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
+    return res.status(400).json({ error: "Valid target address required (?target=0x... — the contract you're about to interact with)" });
+  }
+  if (token && !/^0x[a-fA-F0-9]{40}$/.test(token)) {
+    return res.status(400).json({ error: "Invalid token address format (must be 0x + 40 hex chars)" });
+  }
+  if (counterparty && !/^0x[a-fA-F0-9]{40}$/.test(counterparty)) {
+    return res.status(400).json({ error: "Invalid counterparty address format (must be 0x + 40 hex chars)" });
+  }
+
+  const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
+  const startTime = Date.now();
+
+  try {
+    // Run all checks in parallel — only protocol is mandatory
+    const checks = await Promise.allSettled([
+      scoreProtocol(target, chain),
+      token ? (async () => {
+        const [security, market] = await Promise.all([
+          getTokenSecurity(token, chain),
+          getTokenMarketData(token),
+        ]);
+        const scored = scoreToken(security, market);
+        return { address: token, token_name: security.token_name, token_symbol: security.token_symbol, ...scored };
+      })() : Promise.resolve(null),
+      counterparty ? scoreCounterparty(counterparty, chain) : Promise.resolve(null),
+      analyzePosition(target, counterparty || null, chain),
+    ]);
+
+    const [protocolResult, tokenResult, counterpartyResult, positionResult] = checks.map(
+      (r) => r.status === "fulfilled" ? r.value : null
+    );
+
+    // Build component summary
+    const components = {
+      protocol: protocolResult ? {
+        verdict: protocolResult.verdict,
+        grade: protocolResult.trust_grade,
+        score: protocolResult.trust_score,
+        risk_flags: protocolResult.risk_flags,
+      } : { verdict: "ERROR", grade: "N/A", score: null, risk_flags: ["Protocol check failed"] },
+
+      token: tokenResult ? {
+        verdict: tokenResult.verdict,
+        grade: tokenResult.trust_grade,
+        score: tokenResult.trust_score,
+        name: tokenResult.token_name,
+        symbol: tokenResult.token_symbol,
+        risk_flags: tokenResult.risk_flags,
+      } : null,
+
+      counterparty: counterpartyResult ? {
+        verdict: counterpartyResult.verdict,
+        grade: counterpartyResult.trust_grade,
+        score: counterpartyResult.trust_score,
+        risk_flags: counterpartyResult.risk_flags,
+      } : null,
+
+      position: positionResult ? {
+        verdict: positionResult.verdict,
+        grade: positionResult.trust_grade,
+        score: positionResult.trust_score,
+        risk_flags: positionResult.risk_flags,
+        recommendations: positionResult.recommendations,
+      } : null,
+    };
+
+    // Compute composite score — weighted by what checks were actually run
+    // Protocol is always heaviest; others scale if present
+    const scores = [];
+    const weights = [];
+
+    if (components.protocol.score !== null) { scores.push(components.protocol.score); weights.push(0.35); }
+    if (components.position?.score !== null) { scores.push(components.position.score); weights.push(0.25); }
+    if (components.token?.score !== null)    { scores.push(components.token.score);    weights.push(0.20); }
+    if (components.counterparty?.score !== null) { scores.push(components.counterparty.score); weights.push(0.20); }
+
+    // Normalize weights to sum to 1.0
+    const weightSum = weights.reduce((a, b) => a + b, 0);
+    const compositeScore = Math.round(
+      scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0)
+    );
+    const { grade, verdict } = gradeFromScore(compositeScore);
+
+    // Aggregate all risk flags
+    const allRiskFlags = [
+      ...(components.protocol.risk_flags || []),
+      ...(components.token?.risk_flags || []),
+      ...(components.counterparty?.risk_flags || []),
+      ...(components.position?.risk_flags || []),
+    ];
+
+    // Hard blockers: sanctions or honeypot override the composite
+    const hardBlock = allRiskFlags.some(f =>
+      f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED")
+    );
+    const finalVerdict = hardBlock ? "DANGER" : verdict;
+    const finalGrade = hardBlock ? "F" : grade;
+    const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
+
+    // Proceed recommendation
+    const proceed = !hardBlock && finalScore >= 40;
+
+    const result = {
+      target,
+      token: token || null,
+      counterparty: counterparty || null,
+      chain,
+      verdict: finalVerdict,
+      trust_grade: finalGrade,
+      composite_score: finalScore,
+      proceed,
+      proceed_recommendation: proceed
+        ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags")
+        : "DO NOT PROCEED — elevated risk detected",
+      checks_summary: {
+        protocol: components.protocol.grade,
+        token: components.token?.grade || "not_checked",
+        counterparty: components.counterparty?.grade || "not_checked",
+        position: components.position?.grade || "not_checked",
+      },
+      risk_flags: allRiskFlags,
+      components: detailLevel === "minimal" ? undefined : components,
+      recommendations: positionResult?.recommendations || [],
+      meta: {
+        response_time_ms: Date.now() - startTime,
+        data_freshness: new Date().toISOString(),
+        sentinel_version: "0.1.0",
+        checks_run: [
+          "protocol",
+          token ? "token" : null,
+          counterparty ? "counterparty" : null,
+          "position",
+        ].filter(Boolean),
+      },
+    };
+
+    // Apply detail filtering
+    if (detailLevel === "minimal") {
+      res.json({
+        target: result.target,
+        chain: result.chain,
+        verdict: result.verdict,
+        trust_grade: result.trust_grade,
+        composite_score: result.composite_score,
+        proceed: result.proceed,
+        proceed_recommendation: result.proceed_recommendation,
+        checks_summary: result.checks_summary,
+        meta: result.meta,
+      });
+    } else if (detailLevel === "standard") {
+      const { components: _c, ...rest } = result;
+      res.json(rest);
+    } else {
+      res.json(result);
+    }
+  } catch (error) {
+    console.error("Preflight error:", error);
+    res.status(500).json({ error: "Preflight check failed", detail: error.message });
+  }
 });
 
 
@@ -1167,9 +1659,9 @@ app.get("/health", (req, res) => {
     endpoints: {
       "/verify/protocol":     { price: "$0.008 USDC", status: "live",    description: "Protocol trust verification" },
       "/verify/position":     { price: "$0.005 USDC", status: "live",    description: "Position risk analysis" },
-      "/verify/counterparty": { price: "$0.010 USDC", status: "phase3",  description: "Counterparty intelligence" },
+      "/verify/counterparty": { price: "$0.010 USDC", status: "live",    description: "Counterparty intelligence" },
       "/verify/token":        { price: "$0.005 USDC", status: "live",    description: "Token legitimacy check" },
-      "/preflight":           { price: "$0.025 USDC", status: "phase4",  description: "Unified pre-transaction safety" },
+      "/preflight":           { price: "$0.025 USDC", status: "live",    description: "Unified pre-transaction safety" },
     },
   });
 });
@@ -1223,7 +1715,78 @@ if (NETWORK === "base-sepolia") {
     }
   });
 
-  console.log("  [DEV] Test routes enabled: /test/protocol, /test/token, /test/position");
+  app.get("/test/counterparty", async (req, res) => {
+    const { address, chain = "base", detail = "full" } = req.query;
+    if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      return res.status(400).json({ error: "Valid address required" });
+    }
+    try {
+      const result = await scoreCounterparty(address, chain);
+      res.json(filterResponse(result, detail));
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/test/preflight", async (req, res) => {
+    const { target, token, counterparty, chain = "base", detail = "full" } = req.query;
+    if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
+      return res.status(400).json({ error: "Valid target address required (?target=0x...)" });
+    }
+    try {
+      // Run all checks in parallel
+      const checks = await Promise.allSettled([
+        scoreProtocol(target, chain),
+        token ? (async () => {
+          const [security, market] = await Promise.all([getTokenSecurity(token, chain), getTokenMarketData(token)]);
+          const scored = scoreToken(security, market);
+          return { address: token, token_name: security.token_name, token_symbol: security.token_symbol, ...scored };
+        })() : Promise.resolve(null),
+        counterparty ? scoreCounterparty(counterparty, chain) : Promise.resolve(null),
+        analyzePosition(target, counterparty || null, chain),
+      ]);
+      const [protocolResult, tokenResult, counterpartyResult, positionResult] = checks.map(r => r.status === "fulfilled" ? r.value : null);
+
+      const components = {
+        protocol: protocolResult ? { verdict: protocolResult.verdict, grade: protocolResult.trust_grade, score: protocolResult.trust_score, risk_flags: protocolResult.risk_flags } : { verdict: "ERROR", grade: "N/A", score: null, risk_flags: ["Protocol check failed"] },
+        token: tokenResult ? { verdict: tokenResult.verdict, grade: tokenResult.trust_grade, score: tokenResult.trust_score, name: tokenResult.token_name, symbol: tokenResult.token_symbol, risk_flags: tokenResult.risk_flags } : null,
+        counterparty: counterpartyResult ? { verdict: counterpartyResult.verdict, grade: counterpartyResult.trust_grade, score: counterpartyResult.trust_score, risk_flags: counterpartyResult.risk_flags } : null,
+        position: positionResult ? { verdict: positionResult.verdict, grade: positionResult.trust_grade, score: positionResult.trust_score, risk_flags: positionResult.risk_flags, recommendations: positionResult.recommendations } : null,
+      };
+
+      const scores = [], weights = [];
+      if (components.protocol.score !== null) { scores.push(components.protocol.score); weights.push(0.35); }
+      if (components.position?.score !== null) { scores.push(components.position.score); weights.push(0.25); }
+      if (components.token?.score !== null)    { scores.push(components.token.score);    weights.push(0.20); }
+      if (components.counterparty?.score !== null) { scores.push(components.counterparty.score); weights.push(0.20); }
+      const weightSum = weights.reduce((a, b) => a + b, 0);
+      const compositeScore = Math.round(scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0));
+      const { grade, verdict } = gradeFromScore(compositeScore);
+
+      const allRiskFlags = [...(components.protocol.risk_flags || []), ...(components.token?.risk_flags || []), ...(components.counterparty?.risk_flags || []), ...(components.position?.risk_flags || [])];
+      const hardBlock = allRiskFlags.some(f => f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED"));
+      const finalVerdict = hardBlock ? "DANGER" : verdict;
+      const finalGrade = hardBlock ? "F" : grade;
+      const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
+      const proceed = !hardBlock && finalScore >= 40;
+
+      const result = {
+        target, token: token || null, counterparty: counterparty || null, chain, verdict: finalVerdict, trust_grade: finalGrade, composite_score: finalScore, proceed,
+        proceed_recommendation: proceed ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags") : "DO NOT PROCEED — elevated risk detected",
+        checks_summary: { protocol: components.protocol.grade, token: components.token?.grade || "not_checked", counterparty: components.counterparty?.grade || "not_checked", position: components.position?.grade || "not_checked" },
+        risk_flags: allRiskFlags, components, recommendations: positionResult?.recommendations || [],
+        meta: { response_time_ms: Date.now(), data_freshness: new Date().toISOString(), sentinel_version: "0.1.0", checks_run: ["protocol", token ? "token" : null, counterparty ? "counterparty" : null, "position"].filter(Boolean) },
+      };
+      const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
+      if (detailLevel === "minimal") { res.json({ target: result.target, chain: result.chain, verdict: result.verdict, trust_grade: result.trust_grade, composite_score: result.composite_score, proceed: result.proceed, proceed_recommendation: result.proceed_recommendation, checks_summary: result.checks_summary, meta: result.meta }); }
+      else if (detailLevel === "standard") { const { components: _c, ...rest } = result; res.json(rest); }
+      else { res.json(result); }
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  console.log("  [DEV] Test routes enabled: /test/protocol, /test/token, /test/position, /test/counterparty, /test/preflight");
 }
 
 
@@ -1244,7 +1807,6 @@ app.listen(PORT, () => {
   │    GET /verify/protocol  ($0.008 USDC)       │
   │    GET /verify/token     ($0.005 USDC)       │
   │    GET /verify/position  ($0.005 USDC)       │
-  │  COMING:                                     │
   │    GET /verify/counterparty ($0.01 USDC)     │
   │    GET /preflight        ($0.025 USDC)       │
   │  FREE:                                       │
