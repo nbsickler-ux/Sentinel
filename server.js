@@ -426,8 +426,11 @@ async function getContractMetadata(contractAddress, chain) {
     try {
       // Get source code verification status
       const sourceResponse = await axios.get(
-        `${etherscanV2}&module=contract&action=getsourcecode&address=${contractAddress}&apikey=${ETHERSCAN_API_KEY}`,
-        { timeout: 5000 }
+        `${etherscanV2}&module=contract&action=getsourcecode&address=${contractAddress}`,
+        {
+          timeout: 5000,
+          headers: { 'X-API-Key': ETHERSCAN_API_KEY }
+        }
       );
       const sourceData = sourceResponse.data?.result?.[0];
       if (sourceData) {
@@ -439,21 +442,30 @@ async function getContractMetadata(contractAddress, chain) {
 
       // Get contract creation date
       const txResponse = await axios.get(
-        `${etherscanV2}&module=contract&action=getcontractcreation&contractaddresses=${contractAddress}&apikey=${ETHERSCAN_API_KEY}`,
-        { timeout: 5000 }
+        `${etherscanV2}&module=contract&action=getcontractcreation&contractaddresses=${contractAddress}`,
+        {
+          timeout: 5000,
+          headers: { 'X-API-Key': ETHERSCAN_API_KEY }
+        }
       );
       const txData = txResponse.data?.result?.[0];
       if (txData && txData.txHash) {
         // Get the transaction to find the block timestamp
         const blockResponse = await axios.get(
-          `${etherscanV2}&module=proxy&action=eth_getTransactionByHash&txhash=${txData.txHash}&apikey=${ETHERSCAN_API_KEY}`,
-          { timeout: 5000 }
+          `${etherscanV2}&module=proxy&action=eth_getTransactionByHash&txhash=${txData.txHash}`,
+          {
+            timeout: 5000,
+            headers: { 'X-API-Key': ETHERSCAN_API_KEY }
+          }
         );
         const blockNum = blockResponse.data?.result?.blockNumber;
         if (blockNum) {
           const blockDetailResponse = await axios.get(
-            `${etherscanV2}&module=proxy&action=eth_getBlockByNumber&tag=${blockNum}&boolean=false&apikey=${ETHERSCAN_API_KEY}`,
-            { timeout: 5000 }
+            `${etherscanV2}&module=proxy&action=eth_getBlockByNumber&tag=${blockNum}&boolean=false`,
+            {
+              timeout: 5000,
+              headers: { 'X-API-Key': ETHERSCAN_API_KEY }
+            }
           );
           const timestamp = blockDetailResponse.data?.result?.timestamp;
           if (timestamp) {
@@ -643,12 +655,15 @@ function scoreToken(security, market) {
   const dimensions = {};
   const riskFlags = [];
 
+  // Determine confidence based on data availability
+  const confidence = security.available ? 0.90 : 0.50;
+
   if (!security.available) {
     return {
       verdict: "UNKNOWN",
       trust_grade: "N/A",
       trust_score: null,
-      confidence: 0.1,
+      confidence,
       dimensions: {},
       risk_flags: ["No security data available for this token"],
       meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION },
@@ -711,7 +726,7 @@ function scoreToken(security, market) {
   );
   const { grade, verdict } = gradeFromScore(compositeScore);
 
-  return { verdict, trust_grade: grade, trust_score: compositeScore, dimensions, risk_flags: riskFlags };
+  return { verdict, trust_grade: grade, trust_score: compositeScore, confidence, dimensions, risk_flags: riskFlags, meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION } };
 }
 
 
@@ -1580,7 +1595,7 @@ app.post("/verify/protocol", async (req, res) => {
     res.json(filterResponse(result, detailLevel));
   } catch (error) {
     console.error("Protocol verification error:", error);
-    res.status(500).json({ error: "Verification failed", detail: error.message });
+    res.status(500).json({ error: "Protocol verification failed. Please try again later." });
   }
 });
 
@@ -1604,7 +1619,7 @@ app.post("/verify/position", async (req, res) => {
     res.json(filterResponse(result, detailLevel));
   } catch (error) {
     console.error("Position analysis error:", error);
-    res.status(500).json({ error: "Position analysis failed", detail: error.message });
+    res.status(500).json({ error: "Position analysis failed. Please try again later." });
   }
 });
 
@@ -1626,7 +1641,7 @@ app.post("/verify/counterparty", async (req, res) => {
     res.json(filterResponse(result, DETAIL_LEVELS.includes(detail) ? detail : "full"));
   } catch (error) {
     console.error("Counterparty verification error:", error);
-    res.status(500).json({ error: "Counterparty verification failed", detail: error.message });
+    res.status(500).json({ error: "Counterparty verification failed. Please try again later." });
   }
 });
 
@@ -1693,7 +1708,7 @@ app.post("/verify/token", async (req, res) => {
     res.json(filterResponse(fullResult, detailLevel));
   } catch (error) {
     console.error("Token verification error:", error);
-    res.status(500).json({ error: "Token verification failed", detail: error.message });
+    res.status(500).json({ error: "Token verification failed. Please try again later." });
   }
 });
 
@@ -1865,7 +1880,7 @@ app.post("/preflight", async (req, res) => {
     }
   } catch (error) {
     console.error("Preflight error:", error);
-    res.status(500).json({ error: "Preflight check failed", detail: error.message });
+    res.status(500).json({ error: "Preflight check failed. Please try again later." });
   }
 });
 
@@ -2157,7 +2172,8 @@ if (NETWORK === "base-sepolia") {
       const result = await scoreProtocol(address, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error("Test protocol verification error:", error);
+      res.status(500).json({ error: "Protocol verification failed. Please try again later." });
     }
   });
 
@@ -2174,7 +2190,8 @@ if (NETWORK === "base-sepolia") {
       const result = scoreToken(security, market);
       res.json(filterResponse({ address, chain, token_name: security.token_name, token_symbol: security.token_symbol, ...result }, detail));
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error("Test token verification error:", error);
+      res.status(500).json({ error: "Token verification failed. Please try again later." });
     }
   });
 
@@ -2187,7 +2204,8 @@ if (NETWORK === "base-sepolia") {
       const result = await analyzePosition(protocolAddress, user || null, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error("Test position analysis error:", error);
+      res.status(500).json({ error: "Position analysis failed. Please try again later." });
     }
   });
 
@@ -2200,7 +2218,8 @@ if (NETWORK === "base-sepolia") {
       const result = await scoreCounterparty(address, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error("Test counterparty verification error:", error);
+      res.status(500).json({ error: "Counterparty verification failed. Please try again later." });
     }
   });
 
@@ -2258,7 +2277,8 @@ if (NETWORK === "base-sepolia") {
       else if (detailLevel === "standard") { const { components: _c, ...rest } = result; res.json(rest); }
       else { res.json(result); }
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      console.error("Test preflight error:", error);
+      res.status(500).json({ error: "Preflight check failed. Please try again later." });
     }
   });
 
