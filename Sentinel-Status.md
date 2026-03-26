@@ -10,9 +10,11 @@ Sentinel is an x402-gated trust verification service for autonomous AI agents. A
 
 ---
 
-## Current State: Phase 2 Complete (Local Dev)
+## Current State: Deployed to Production
 
-The server runs locally on Base Sepolia testnet with a working x402 payment wall and live data integrations. Three paid endpoints are now live: `/verify/protocol`, `/verify/token`, and `/verify/position`. All endpoints support a `detail` query parameter to control how much scoring methodology is exposed in responses.
+**Live URL:** https://sentinel-awms.onrender.com
+
+The server is deployed on Render with a working x402 payment wall and live data integrations. Three paid endpoints are live: `/verify/protocol`, `/verify/token`, and `/verify/position`. All endpoints support a `detail` query parameter to control how much scoring methodology is exposed in responses. Dev test routes are active (base-sepolia mode) and will auto-disable when switched to mainnet.
 
 ---
 
@@ -149,14 +151,16 @@ All paid endpoints accept a `?detail=` parameter:
 - [x] Project status sheet created
 - [x] All three endpoints tested with live data (BRETT B/82, DEGEN B/84, Uniswap Router B/70)
 - [x] Dev test routes added (`/test/protocol`, `/test/token`, `/test/position`) — active only on base-sepolia
+- [x] GitHub private repo created (nbsickler-ux/Sentinel)
+- [x] Deployed to Render — public URL live, health check confirmed, 402 paywall verified
 
 ## What's Next
 
 ### Immediate
 - [ ] End-to-end paid verification test with a funded Sepolia wallet
 
-### Phase 3 — Deployment & Discovery
-- [ ] Deploy to Railway (or Cloudflare Workers) for a public URL
+### Phase 3 — Discovery & Mainnet
+- [x] Deployed to Render (https://sentinel-awms.onrender.com)
 - [ ] Register on the Bazaar so agents can discover Sentinel
 - [ ] Switch default `detail` level to `standard` for production
 

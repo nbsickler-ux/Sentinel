@@ -16,6 +16,7 @@ import express from "express";
 import { paymentMiddlewareFromConfig } from "@x402/express";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import dotenv from "dotenv";
 import axios from "axios";
 
@@ -897,6 +898,36 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Protocol Verification - trust assessment for any smart contract",
+    ...declareDiscoveryExtension({
+      input: { address: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      inputSchema: {
+        properties: {
+          address: { type: "string", description: "Contract address to verify (0x + 40 hex chars)" },
+          chain: { type: "string", description: "Chain name: 'base' or 'base-sepolia'", enum: ["base", "base-sepolia"] },
+          detail: { type: "string", description: "Response detail level", enum: ["full", "standard", "minimal"] },
+        },
+        required: ["address"],
+      },
+      output: {
+        example: {
+          address: "0x2626664c2603336e57b271c5c0b26f421741e481",
+          chain: "base",
+          verdict: "LOW_RISK",
+          trust_grade: "B",
+          trust_score: 70,
+          confidence: 0.88,
+          risk_flags: ["Proxy contract (Proxy) - admin upgrade possible"],
+        },
+        schema: {
+          properties: {
+            verdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"] },
+            trust_grade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+            trust_score: { type: "number" },
+            confidence: { type: "number" },
+          },
+        },
+      },
+    }),
   },
   "GET /verify/token": {
     accepts: {
@@ -906,6 +937,38 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Token Verification - honeypot detection, tax analysis, ownership risks",
+    ...declareDiscoveryExtension({
+      input: { address: "0x532f27101965dd16442E59d40670FaF5eBB142E4", chain: "base" },
+      inputSchema: {
+        properties: {
+          address: { type: "string", description: "Token contract address (0x + 40 hex chars)" },
+          chain: { type: "string", description: "Chain name: 'base' or 'base-sepolia'", enum: ["base", "base-sepolia"] },
+          detail: { type: "string", description: "Response detail level", enum: ["full", "standard", "minimal"] },
+        },
+        required: ["address"],
+      },
+      output: {
+        example: {
+          address: "0x532f27101965dd16442E59d40670FaF5eBB142E4",
+          chain: "base",
+          token_name: "Brett",
+          token_symbol: "BRETT",
+          verdict: "LOW_RISK",
+          trust_grade: "B",
+          trust_score: 82,
+          risk_flags: ["Slippage is modifiable by owner"],
+        },
+        schema: {
+          properties: {
+            verdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"] },
+            trust_grade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+            trust_score: { type: "number" },
+            token_name: { type: "string" },
+            token_symbol: { type: "string" },
+          },
+        },
+      },
+    }),
   },
   "GET /verify/position": {
     accepts: {
@@ -915,6 +978,35 @@ const paymentRoutes = {
       payTo: WALLET_ADDRESS,
     },
     description: "Sentinel Position Analysis - DeFi position risk assessment with protocol trust scoring",
+    ...declareDiscoveryExtension({
+      input: { protocol: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      inputSchema: {
+        properties: {
+          protocol: { type: "string", description: "Protocol contract address (0x + 40 hex chars)" },
+          user: { type: "string", description: "User wallet address (optional)" },
+          chain: { type: "string", description: "Chain name: 'base' or 'base-sepolia'", enum: ["base", "base-sepolia"] },
+          detail: { type: "string", description: "Response detail level", enum: ["full", "standard", "minimal"] },
+        },
+        required: ["protocol"],
+      },
+      output: {
+        example: {
+          protocol_address: "0x2626664c2603336e57b271c5c0b26f421741e481",
+          chain: "base",
+          verdict: "CAUTION",
+          trust_grade: "C",
+          trust_score: 57,
+          recommendations: ["Monitor TVL trends - rapid outflows may signal issues"],
+        },
+        schema: {
+          properties: {
+            verdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"] },
+            trust_grade: { type: "string", enum: ["A", "B", "C", "D", "F"] },
+            trust_score: { type: "number" },
+          },
+        },
+      },
+    }),
   },
 };
 
