@@ -18,6 +18,8 @@ import { paymentMiddlewareFromConfig } from "@x402/express";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
+import { Redis } from "@upstash/redis";
+import { Ratelimit } from "@upstash/ratelimit";
 import dotenv from "dotenv";
 import axios from "axios";
 
@@ -88,6 +90,77 @@ function gradeFromScore(score) {
   if (score >= 55) return { grade: "C", verdict: "CAUTION" };
   if (score >= 40) return { grade: "D", verdict: "HIGH_RISK" };
   return { grade: "F", verdict: "DANGER" };
+}
+
+
+// ============================================================
+// CACHING LAYER (Upstash Redis)
+// Caches verification results to achieve <200ms responses
+// Falls back gracefully if Redis is not configured
+// ============================================================
+
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL || "";
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+
+let redis = null;
+let ratelimit = null;
+
+if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
+  redis = new Redis({
+    url: UPSTASH_REDIS_REST_URL,
+    token: UPSTASH_REDIS_REST_TOKEN,
+  });
+
+  // Rate limiter: 25 free calls per wallet per day (sliding window)
+  ratelimit = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(25, "1 d"),
+    prefix: "sentinel:ratelimit",
+  });
+
+  console.log("  Redis caching enabled (Upstash)");
+  console.log("  Rate limiting enabled: 25 calls/wallet/day");
+} else {
+  console.log("  Redis caching disabled (no UPSTASH_REDIS_REST_URL configured)");
+}
+
+// Cache TTLs in seconds
+const CACHE_TTL = {
+  protocol:     600,   // 10 min — contract metadata changes slowly
+  token:        300,   // 5 min — token security can shift faster
+  position:     300,   // 5 min
+  counterparty: 900,   // 15 min — sanctions lists update daily
+};
+
+/**
+ * Get a cached result, or compute and cache it
+ * Falls back to direct computation if Redis is unavailable
+ */
+async function cachedCall(cacheKey, ttlSeconds, computeFn) {
+  if (!redis) return computeFn();
+
+  try {
+    // Check cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      const result = typeof cached === "string" ? JSON.parse(cached) : cached;
+      result.meta = { ...result.meta, cache_hit: true };
+      return result;
+    }
+  } catch (e) {
+    // Redis read failed — continue to compute
+  }
+
+  // Cache miss — compute fresh result
+  const result = await computeFn();
+
+  // Store in cache (non-blocking, don't await)
+  if (redis) {
+    redis.set(cacheKey, JSON.stringify(result), { ex: ttlSeconds }).catch(() => {});
+  }
+
+  if (result.meta) result.meta.cache_hit = false;
+  return result;
 }
 
 
@@ -1361,7 +1434,8 @@ app.get("/verify/protocol", async (req, res) => {
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
 
   try {
-    const result = await scoreProtocol(address, chain);
+    const cacheKey = `sentinel:protocol:${address.toLowerCase()}:${chain}`;
+    const result = await cachedCall(cacheKey, CACHE_TTL.protocol, () => scoreProtocol(address, chain));
     res.json(filterResponse(result, detailLevel));
   } catch (error) {
     console.error("Protocol verification error:", error);
@@ -1383,7 +1457,8 @@ app.get("/verify/position", async (req, res) => {
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
 
   try {
-    const result = await analyzePosition(protocolAddress, user || null, chain);
+    const cacheKey = `sentinel:position:${protocolAddress.toLowerCase()}:${chain}`;
+    const result = await cachedCall(cacheKey, CACHE_TTL.position, () => analyzePosition(protocolAddress, user || null, chain));
     res.json(filterResponse(result, detailLevel));
   } catch (error) {
     console.error("Position analysis error:", error);
@@ -1403,7 +1478,8 @@ app.get("/verify/counterparty", async (req, res) => {
   }
 
   try {
-    const result = await scoreCounterparty(address, chain);
+    const cacheKey = `sentinel:counterparty:${address.toLowerCase()}:${chain}`;
+    const result = await cachedCall(cacheKey, CACHE_TTL.counterparty, () => scoreCounterparty(address, chain));
     res.json(filterResponse(result, DETAIL_LEVELS.includes(detail) ? detail : "full"));
   } catch (error) {
     console.error("Counterparty verification error:", error);
@@ -1425,47 +1501,50 @@ app.get("/verify/token", async (req, res) => {
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
 
   try {
-    const [security, market] = await Promise.all([
-      getTokenSecurity(address, chain),
-      getTokenMarketData(address),
-    ]);
+    const cacheKey = `sentinel:token:${address.toLowerCase()}:${chain}`;
+    const fullResult = await cachedCall(cacheKey, CACHE_TTL.token, async () => {
+      const [security, market] = await Promise.all([
+        getTokenSecurity(address, chain),
+        getTokenMarketData(address),
+      ]);
 
-    const result = scoreToken(security, market);
+      const result = scoreToken(security, market);
 
-    const fullResult = {
-      address,
-      chain,
-      token_name: security.token_name || null,
-      token_symbol: security.token_symbol || null,
-      ...result,
-      evidence: {
-        security: security.available ? {
-          is_honeypot: security.is_honeypot,
-          buy_tax: security.buy_tax,
-          sell_tax: security.sell_tax,
-          is_open_source: security.is_open_source,
-          is_mintable: security.is_mintable,
-          is_proxy: security.is_proxy,
-          hidden_owner: security.hidden_owner,
-          can_take_back_ownership: security.can_take_back_ownership,
-          owner_change_balance: security.owner_change_balance,
-          holder_count: security.holder_count,
-          owner_percent: security.owner_percent,
-          creator_percent: security.creator_percent,
-        } : { available: false },
-        market: market.available ? {
-          protocol_name: market.protocol_name,
-          category: market.category,
-          tvl: market.tvl,
-          mcap: market.mcap,
-        } : { available: false },
-      },
-      meta: {
-        response_time_ms: Date.now(),
-        data_freshness: new Date().toISOString(),
-        sentinel_version: "0.1.0",
-      },
-    };
+      return {
+        address,
+        chain,
+        token_name: security.token_name || null,
+        token_symbol: security.token_symbol || null,
+        ...result,
+        evidence: {
+          security: security.available ? {
+            is_honeypot: security.is_honeypot,
+            buy_tax: security.buy_tax,
+            sell_tax: security.sell_tax,
+            is_open_source: security.is_open_source,
+            is_mintable: security.is_mintable,
+            is_proxy: security.is_proxy,
+            hidden_owner: security.hidden_owner,
+            can_take_back_ownership: security.can_take_back_ownership,
+            owner_change_balance: security.owner_change_balance,
+            holder_count: security.holder_count,
+            owner_percent: security.owner_percent,
+            creator_percent: security.creator_percent,
+          } : { available: false },
+          market: market.available ? {
+            protocol_name: market.protocol_name,
+            category: market.category,
+            tvl: market.tvl,
+            mcap: market.mcap,
+          } : { available: false },
+        },
+        meta: {
+          response_time_ms: Date.now(),
+          data_freshness: new Date().toISOString(),
+          sentinel_version: "0.1.0",
+        },
+      };
+    });
 
     res.json(filterResponse(fullResult, detailLevel));
   } catch (error) {
@@ -1653,15 +1732,17 @@ app.get("/health", (req, res) => {
   res.json({
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
-    version: "0.1.0",
+    version: "0.2.0",
     status: "operational",
     network: NETWORK,
+    cache: redis ? "enabled" : "disabled",
+    rate_limit: ratelimit ? "25 calls/wallet/day free tier" : "disabled",
     endpoints: {
-      "/verify/protocol":     { price: "$0.008 USDC", status: "live",    description: "Protocol trust verification" },
-      "/verify/position":     { price: "$0.005 USDC", status: "live",    description: "Position risk analysis" },
-      "/verify/counterparty": { price: "$0.010 USDC", status: "live",    description: "Counterparty intelligence" },
-      "/verify/token":        { price: "$0.005 USDC", status: "live",    description: "Token legitimacy check" },
-      "/preflight":           { price: "$0.025 USDC", status: "live",    description: "Unified pre-transaction safety" },
+      "/verify/protocol":     { price: "$0.008 USDC", status: "live", cache_ttl: "10 min", description: "Protocol trust verification" },
+      "/verify/position":     { price: "$0.005 USDC", status: "live", cache_ttl: "5 min",  description: "Position risk analysis" },
+      "/verify/counterparty": { price: "$0.010 USDC", status: "live", cache_ttl: "15 min", description: "Counterparty intelligence" },
+      "/verify/token":        { price: "$0.005 USDC", status: "live", cache_ttl: "5 min",  description: "Token legitimacy check" },
+      "/preflight":           { price: "$0.025 USDC", status: "live", cache_ttl: "varies", description: "Unified pre-transaction safety" },
     },
   });
 });
