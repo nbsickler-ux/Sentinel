@@ -27,6 +27,7 @@ import axios from "axios";
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", true);   // Render (and most PaaS) sit behind a reverse proxy — trust X-Forwarded-Proto so req.protocol is "https"
 app.use(express.json());
 
 // ============================================================
