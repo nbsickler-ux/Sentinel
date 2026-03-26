@@ -1421,15 +1421,9 @@ const schemes = [
   { network: "eip155:8453",  server: new ExactEvmScheme() },  // Base Mainnet
 ];
 
-// Sync with facilitator on startup so the middleware knows what payment
-// schemes are supported. Falls back gracefully if auth fails (e.g. wrong
-// key format) — server still boots, paid endpoints return 500 until fixed.
-app.use(paymentMiddlewareFromConfig(
-  paymentRoutes, facilitator, schemes,
-  /* paywallConfig */ undefined,
-  /* paywall */       undefined,
-  /* syncFacilitatorOnStart */ false,
-));
+// Sync with facilitator on startup so the middleware learns what payment
+// schemes / networks are supported (required for 402 responses to work).
+app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
 
 
 // ============================================================
