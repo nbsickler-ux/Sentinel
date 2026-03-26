@@ -32,6 +32,7 @@ app.use(express.json());
 // ============================================================
 // CONFIGURATION
 // ============================================================
+const VERSION = "0.4.0";
 const PORT = process.env.PORT || 4021;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 const NETWORK = process.env.NETWORK || "base-sepolia";
@@ -208,6 +209,16 @@ async function loadProtocolRegistry() {
             hacked: p.hacked || false,
             hackDate: p.hackDate || null,
             hackAmount: p.hackAmount || null,
+            // Governance & community signals
+            governanceID: p.governanceID || null,  // e.g. "snapshot:uniswap"
+            treasury: p.treasury || null,
+            openSource: p.openSource !== false,     // Most are open source
+            forkedFrom: p.forkedFrom || [],
+            twitter: p.twitter || null,
+            url: p.url || null,
+            listedAt: p.listedAt || null,           // Unix timestamp when listed on DeFiLlama
+            mcap: p.mcap || null,
+            chainTvls: p.chainTvls || {},
           };
         }
       }
@@ -627,7 +638,7 @@ function scoreToken(security, market) {
       confidence: 0.1,
       dimensions: {},
       risk_flags: ["No security data available for this token"],
-      meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: "0.1.0" },
+      meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION },
     };
   }
 
@@ -808,7 +819,7 @@ async function analyzePosition(protocolAddress, userAddress, chain) {
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
-      sentinel_version: "0.1.0",
+      sentinel_version: VERSION,
     },
   };
 }
@@ -1069,7 +1080,7 @@ async function scoreCounterparty(address, chain) {
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
-      sentinel_version: "0.1.0",
+      sentinel_version: VERSION,
     },
   };
 }
@@ -1143,11 +1154,72 @@ async function scoreProtocol(contractAddress, chain) {
     dimensions.tvl_stability = { score: 40, detail: "TVL data unavailable." };
   }
 
-  // Governance risk (10%) - placeholder for Phase 2
-  dimensions.governance = { score: 65, detail: "Governance scoring not yet implemented - default moderate." };
+  // Governance risk (10%) - based on registry metadata
+  const protocolMeta = protocolRegistry[contractAddress.toLowerCase()] || {};
+  {
+    let govScore = 50; // baseline
+    const govDetails = [];
 
-  // Community signal (10%) - placeholder for Phase 2
-  dimensions.community = { score: 60, detail: "Community signal scoring not yet implemented - default moderate." };
+    if (protocolMeta.governanceID) {
+      govScore += 25; // Has on-chain/snapshot governance
+      govDetails.push("Active governance system detected");
+    }
+    if (protocolMeta.treasury) {
+      govScore += 10; // Has a treasury (DAO structure)
+      govDetails.push("Protocol treasury exists");
+    }
+    if (contract.ownerIsMultisig) {
+      govScore += 10; // Multisig ownership = decentralized control
+      govDetails.push("Multisig ownership");
+    }
+    if (protocolMeta.openSource) {
+      govScore += 5;
+      govDetails.push("Open source");
+    }
+
+    dimensions.governance = {
+      score: Math.min(100, Math.max(0, govScore)),
+      detail: govDetails.length > 0 ? govDetails.join(". ") + "." : "No governance signals available.",
+    };
+  }
+
+  // Community signal (10%) - based on ecosystem presence
+  {
+    let commScore = 40; // baseline
+    const commDetails = [];
+
+    if (protocolMeta.twitter) {
+      commScore += 10;
+      commDetails.push("Social presence verified");
+    }
+    if (protocolMeta.url) {
+      commScore += 5;
+      commDetails.push("Active website");
+    }
+    if (protocolMeta.listedAt) {
+      // Longer listing on DeFiLlama = more established community
+      const listedDaysAgo = (Date.now() / 1000 - protocolMeta.listedAt) / 86400;
+      if (listedDaysAgo > 730) { commScore += 20; commDetails.push("Established for 2+ years"); }
+      else if (listedDaysAgo > 365) { commScore += 15; commDetails.push("Established for 1+ year"); }
+      else if (listedDaysAgo > 90) { commScore += 5; commDetails.push("Listed for 3+ months"); }
+    }
+    if (protocolMeta.mcap && protocolMeta.mcap > 100_000_000) {
+      commScore += 15;
+      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
+    } else if (protocolMeta.mcap && protocolMeta.mcap > 10_000_000) {
+      commScore += 10;
+      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
+    }
+    if (protocolMeta.forkedFrom && protocolMeta.forkedFrom.length > 0) {
+      commScore += 5; // Fork of established protocol
+      commDetails.push(`Fork of ${protocolMeta.forkedFrom[0]}`);
+    }
+
+    dimensions.community = {
+      score: Math.min(100, Math.max(0, commScore)),
+      detail: commDetails.length > 0 ? commDetails.join(". ") + "." : "No community signals available.",
+    };
+  }
 
   // Compute composite
   const weights = { audit: 0.25, exploit_history: 0.25, contract_maturity: 0.15, tvl_stability: 0.15, governance: 0.10, community: 0.10 };
@@ -1200,7 +1272,7 @@ async function scoreProtocol(contractAddress, chain) {
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
-      sentinel_version: "0.1.0",
+      sentinel_version: VERSION,
       mock_data: !!contract.mock,
     },
   };
@@ -1427,6 +1499,46 @@ app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
 
 
 // ============================================================
+// RATE LIMITING MIDDLEWARE (applied to all paid endpoints)
+// ============================================================
+
+const PAID_PATHS = ["/verify/protocol", "/verify/token", "/verify/position", "/verify/counterparty", "/preflight"];
+
+app.use(PAID_PATHS, async (req, res, next) => {
+  if (!ratelimit) return next(); // Skip if Redis not configured
+
+  // Identify caller by x-payer-address header (set by x402 after payment)
+  // or fall back to IP address for non-paying requests
+  const walletAddress = req.headers["x-payer-address"] || req.ip || "anonymous";
+  const identifier = walletAddress.toLowerCase();
+
+  try {
+    const { success, limit, remaining, reset } = await ratelimit.limit(identifier);
+
+    // Always set rate limit headers so agents know their quota
+    res.set("X-RateLimit-Limit", String(limit));
+    res.set("X-RateLimit-Remaining", String(remaining));
+    res.set("X-RateLimit-Reset", String(reset));
+
+    if (!success) {
+      return res.status(429).json({
+        error: "Rate limit exceeded",
+        message: `Free tier allows ${limit} calls per day per wallet. Upgrade or wait until ${new Date(reset).toISOString()}.`,
+        limit,
+        remaining: 0,
+        reset: new Date(reset).toISOString(),
+      });
+    }
+  } catch (err) {
+    // If rate limiter fails, let the request through (fail-open)
+    console.error("Rate limiter error (failing open):", err.message);
+  }
+
+  next();
+});
+
+
+// ============================================================
 // API ENDPOINTS
 // ============================================================
 
@@ -1551,7 +1663,7 @@ app.get("/verify/token", async (req, res) => {
         meta: {
           response_time_ms: Date.now(),
           data_freshness: new Date().toISOString(),
-          sentinel_version: "0.1.0",
+          sentinel_version: VERSION,
         },
       };
     });
@@ -1699,7 +1811,7 @@ app.get("/preflight", async (req, res) => {
       meta: {
         response_time_ms: Date.now() - startTime,
         data_freshness: new Date().toISOString(),
-        sentinel_version: "0.1.0",
+        sentinel_version: VERSION,
         checks_run: [
           "protocol",
           token ? "token" : null,
@@ -1745,7 +1857,7 @@ app.get("/", (req, res) => {
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
     description: "Sentinel is an x402-gated verification service that helps autonomous AI agents assess on-chain risk before executing transactions on Base. Pay per query in USDC — no API keys, no accounts, no subscriptions.",
-    version: "0.3.0",
+    version: VERSION,
     network: NETWORK,
     base_url: `https://sentinel-awms.onrender.com`,
     payment_protocol: "x402 (HTTP 402 Payment Required)",
@@ -1781,7 +1893,7 @@ app.get("/openapi.json", (req, res) => {
     info: {
       title: "Sentinel — The Trust Layer for Autonomous Agents",
       description: "x402-gated on-chain risk verification service for AI agents on Base. Pay per query in USDC with no API keys required. Agents send a request, receive HTTP 402, sign a USDC payment, and get trust verification results.",
-      version: "0.3.0",
+      version: VERSION,
       contact: { name: "Sentinel", url: "https://github.com/nbsickler-ux/Sentinel" },
       "x-payment-protocol": "x402",
       "x-payment-token": "USDC",
@@ -1916,7 +2028,7 @@ app.get("/health", (req, res) => {
   res.json({
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
-    version: "0.3.0",
+    version: VERSION,
     status: "operational",
     network: NETWORK,
     facilitator: (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "cdp (coinbase)" : "x402.org",
@@ -2041,7 +2153,7 @@ if (NETWORK === "base-sepolia") {
         proceed_recommendation: proceed ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags") : "DO NOT PROCEED — elevated risk detected",
         checks_summary: { protocol: components.protocol.grade, token: components.token?.grade || "not_checked", counterparty: components.counterparty?.grade || "not_checked", position: components.position?.grade || "not_checked" },
         risk_flags: allRiskFlags, components, recommendations: positionResult?.recommendations || [],
-        meta: { response_time_ms: Date.now(), data_freshness: new Date().toISOString(), sentinel_version: "0.1.0", checks_run: ["protocol", token ? "token" : null, counterparty ? "counterparty" : null, "position"].filter(Boolean) },
+        meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION, checks_run: ["protocol", token ? "token" : null, counterparty ? "counterparty" : null, "position"].filter(Boolean) },
       };
       const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
       if (detailLevel === "minimal") { res.json({ target: result.target, chain: result.chain, verdict: result.verdict, trust_grade: result.trust_grade, composite_score: result.composite_score, proceed: result.proceed, proceed_recommendation: result.proceed_recommendation, checks_summary: result.checks_summary, meta: result.meta }); }
