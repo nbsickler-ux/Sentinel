@@ -1902,22 +1902,6 @@ app.get("/openapi.json", (req, res) => {
     },
     servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
     paths: {
-      "/": {
-        get: {
-          operationId: "getServiceInfo",
-          summary: "Service overview and quick-start guide",
-          tags: ["Discovery"],
-          responses: { "200": { description: "Service metadata and endpoint listing" } },
-        },
-      },
-      "/health": {
-        get: {
-          operationId: "getHealth",
-          summary: "Health check with cache and rate-limit status",
-          tags: ["Discovery"],
-          responses: { "200": { description: "Operational status, version, and endpoint statuses" } },
-        },
-      },
       "/verify/protocol": {
         get: {
           operationId: "verifyProtocol",
