@@ -1301,6 +1301,7 @@ const paymentRoutes = {
     description: "Sentinel Protocol Verification - trust assessment for any smart contract",
     extensions: declareDiscoveryExtension({
       input: { address: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      bodyType: "json",
       inputSchema: {
         properties: {
           address: { type: "string", description: "Contract address to verify (0x + 40 hex chars)" },
@@ -1340,6 +1341,7 @@ const paymentRoutes = {
     description: "Sentinel Token Verification - honeypot detection, tax analysis, ownership risks",
     extensions: declareDiscoveryExtension({
       input: { address: "0x532f27101965dd16442E59d40670FaF5eBB142E4", chain: "base" },
+      bodyType: "json",
       inputSchema: {
         properties: {
           address: { type: "string", description: "Token contract address (0x + 40 hex chars)" },
@@ -1381,6 +1383,7 @@ const paymentRoutes = {
     description: "Sentinel Position Analysis - DeFi position risk assessment with protocol trust scoring",
     extensions: declareDiscoveryExtension({
       input: { protocol: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      bodyType: "json",
       inputSchema: {
         properties: {
           protocol: { type: "string", description: "Protocol contract address (0x + 40 hex chars)" },
@@ -1419,6 +1422,7 @@ const paymentRoutes = {
     description: "Sentinel Counterparty Intelligence - OFAC sanctions screening, address reputation, exploit association",
     extensions: declareDiscoveryExtension({
       input: { address: "0x1234567890abcdef1234567890abcdef12345678", chain: "base" },
+      bodyType: "json",
       inputSchema: {
         properties: {
           address: { type: "string", description: "Wallet or contract address to screen (0x + 40 hex chars)" },
@@ -1456,6 +1460,7 @@ const paymentRoutes = {
     description: "Sentinel Preflight Check - unified pre-transaction safety analysis combining protocol trust, token safety, counterparty screening, and position risk in one call",
     extensions: declareDiscoveryExtension({
       input: { target: "0x2626664c2603336e57b271c5c0b26f421741e481", chain: "base" },
+      bodyType: "json",
       inputSchema: {
         properties: {
           target: { type: "string", description: "Primary contract/protocol address for the transaction (0x + 40 hex chars)" },
