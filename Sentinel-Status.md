@@ -1,6 +1,6 @@
 # Sentinel — Project Status
 
-**Last Updated:** March 25, 2026 (Phase 3 complete — all 5 endpoints live)
+**Last Updated:** March 26, 2026 (v0.3.0 — Live on Base mainnet with CDP facilitator)
 
 ---
 
@@ -14,7 +14,7 @@ Sentinel is an x402-gated trust verification service for autonomous AI agents. A
 
 **Live URL:** https://sentinel-awms.onrender.com
 
-The server is deployed on Render with a working x402 payment wall and live data integrations. Three paid endpoints are live: `/verify/protocol`, `/verify/token`, and `/verify/position`. All endpoints support a `detail` query parameter to control how much scoring methodology is exposed in responses. Dev test routes are active (base-sepolia mode) and will auto-disable when switched to mainnet.
+The server is deployed on Render on **Base mainnet** with the Coinbase CDP facilitator handling x402 payments in USDC. All five paid endpoints are live: `/verify/protocol`, `/verify/token`, `/verify/position`, `/verify/counterparty`, and `/preflight`. Upstash Redis caching and rate limiting are enabled. Discovery endpoints (`/`, `/openapi.json`, `/health`) provide machine-readable service metadata for agent frameworks. Dev test routes are disabled on mainnet.
 
 ---
 
@@ -22,8 +22,10 @@ The server is deployed on Render with a working x402 payment wall and live data 
 
 - **Runtime:** Node.js / Express (ESM)
 - **Payment:** @x402/express v2 — `paymentMiddlewareFromConfig` global middleware
-- **Network:** Base Sepolia (`eip155:84532`) for testnet, Base Mainnet (`eip155:8453`) for prod
-- **Facilitator:** `https://x402.org/facilitator` (testnet)
+- **Network:** Base Mainnet (`eip155:8453`)
+- **Facilitator:** Coinbase CDP (`@coinbase/x402` → `api.cdp.coinbase.com`)
+- **Cache:** Upstash Redis with per-endpoint TTLs
+- **Rate Limit:** 25 calls/wallet/day (sliding window via `@upstash/ratelimit`)
 - **Port:** 4021
 
 ## Live Data Sources

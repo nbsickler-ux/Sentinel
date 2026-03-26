@@ -1744,6 +1744,180 @@ app.get("/preflight", async (req, res) => {
 // ============================================================
 // HEALTH & DISCOVERY (free)
 // ============================================================
+
+// Root — human & agent-friendly service overview
+app.get("/", (req, res) => {
+  res.json({
+    service: "Sentinel",
+    tagline: "The Trust Layer for Autonomous Agents",
+    description: "Sentinel is an x402-gated verification service that helps autonomous AI agents assess on-chain risk before executing transactions on Base. Pay per query in USDC — no API keys, no accounts, no subscriptions.",
+    version: "0.3.0",
+    network: NETWORK,
+    base_url: `https://sentinel-awms.onrender.com`,
+    payment_protocol: "x402 (HTTP 402 Payment Required)",
+    payment_token: "USDC on Base",
+    documentation: {
+      openapi: "/openapi.json",
+      health: "/health",
+      integration_guide: "https://github.com/nbsickler-ux/Sentinel/blob/main/INTEGRATION.md",
+    },
+    endpoints: [
+      { path: "GET /verify/protocol",     price: "$0.008 USDC", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
+      { path: "GET /verify/token",         price: "$0.005 USDC", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
+      { path: "GET /verify/position",      price: "$0.005 USDC", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
+      { path: "GET /verify/counterparty",  price: "$0.010 USDC", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
+      { path: "GET /preflight",            price: "$0.025 USDC", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
+    ],
+    trust_verdicts: ["SAFE", "MODERATE", "CAUTION", "DANGER"],
+    grades: ["A+", "A", "B+", "B", "C+", "C", "D", "F"],
+    quick_start: {
+      step_1: "Send a GET request to any endpoint above",
+      step_2: "Receive HTTP 402 with x402 payment details",
+      step_3: "Sign a USDC payment on Base and include the x402 header",
+      step_4: "Receive the trust verification result",
+      example: "GET /verify/protocol?address=0x2626664c2603336e57b271c5c0b26f421741e481&chain=base",
+    },
+  });
+});
+
+// OpenAPI 3.1 spec — machine-readable API contract for agent frameworks
+app.get("/openapi.json", (req, res) => {
+  res.json({
+    openapi: "3.1.0",
+    info: {
+      title: "Sentinel — The Trust Layer for Autonomous Agents",
+      description: "x402-gated on-chain risk verification service for AI agents on Base. Pay per query in USDC with no API keys required. Agents send a request, receive HTTP 402, sign a USDC payment, and get trust verification results.",
+      version: "0.3.0",
+      contact: { name: "Sentinel", url: "https://github.com/nbsickler-ux/Sentinel" },
+      "x-payment-protocol": "x402",
+      "x-payment-token": "USDC",
+      "x-payment-network": "Base (eip155:8453)",
+    },
+    servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
+    paths: {
+      "/": {
+        get: {
+          operationId: "getServiceInfo",
+          summary: "Service overview and quick-start guide",
+          tags: ["Discovery"],
+          responses: { "200": { description: "Service metadata and endpoint listing" } },
+        },
+      },
+      "/health": {
+        get: {
+          operationId: "getHealth",
+          summary: "Health check with cache and rate-limit status",
+          tags: ["Discovery"],
+          responses: { "200": { description: "Operational status, version, and endpoint statuses" } },
+        },
+      },
+      "/verify/protocol": {
+        get: {
+          operationId: "verifyProtocol",
+          summary: "Assess smart contract trustworthiness",
+          description: "Evaluates a smart contract's audit status, TVL, on-chain age, open-source verification, and protocol registry presence. Returns a composite trust score with verdict and grade.",
+          tags: ["Verification"],
+          "x-price": "$0.008 USDC",
+          parameters: [
+            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Contract address to verify" },
+            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
+            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
+          ],
+          responses: {
+            "200": { description: "Trust verification result with score, verdict, grade, and evidence" },
+            "402": { description: "Payment required — x402 payment details in response headers" },
+            "400": { description: "Invalid address format" },
+          },
+        },
+      },
+      "/verify/token": {
+        get: {
+          operationId: "verifyToken",
+          summary: "Check token legitimacy and safety",
+          description: "Detects honeypots, fake tokens, tax manipulation, rugpull patterns, and ownership risks. Uses GoPlus Security API for comprehensive token analysis.",
+          tags: ["Verification"],
+          "x-price": "$0.005 USDC",
+          parameters: [
+            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Token contract address" },
+            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
+            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
+          ],
+          responses: {
+            "200": { description: "Token safety result with honeypot detection, tax analysis, and risk flags" },
+            "402": { description: "Payment required" },
+            "400": { description: "Invalid address format" },
+          },
+        },
+      },
+      "/verify/position": {
+        get: {
+          operationId: "verifyPosition",
+          summary: "Analyze DeFi position risk",
+          description: "Evaluates liquidity depth, impermanent loss risk, pool concentration, and utilization rate for DeFi positions.",
+          tags: ["Verification"],
+          "x-price": "$0.005 USDC",
+          parameters: [
+            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Pool or vault contract address" },
+            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
+            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
+          ],
+          responses: {
+            "200": { description: "Position risk analysis with liquidity and concentration metrics" },
+            "402": { description: "Payment required" },
+            "400": { description: "Invalid address format" },
+          },
+        },
+      },
+      "/verify/counterparty": {
+        get: {
+          operationId: "verifyCounterparty",
+          summary: "Assess counterparty wallet safety",
+          description: "Checks OFAC sanctions list, contract verification status, wallet age, transaction patterns, and activity signals. OFAC hits are hard blockers that override all other scores.",
+          tags: ["Verification"],
+          "x-price": "$0.010 USDC",
+          parameters: [
+            { name: "address", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Wallet or contract address" },
+            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
+            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
+          ],
+          responses: {
+            "200": { description: "Counterparty intelligence with sanctions check and activity analysis" },
+            "402": { description: "Payment required" },
+            "400": { description: "Invalid address format" },
+          },
+        },
+      },
+      "/preflight": {
+        get: {
+          operationId: "preflight",
+          summary: "Unified pre-transaction safety check",
+          description: "Runs protocol, token, position, and counterparty checks in parallel. Computes a weighted composite score (protocol 35%, position 25%, token 20%, counterparty 20%) with dynamic normalization for missing checks. OFAC sanctions and honeypot detections are hard blockers. Returns a single proceed/do-not-proceed recommendation.",
+          tags: ["Verification"],
+          "x-price": "$0.025 USDC",
+          parameters: [
+            { name: "target", in: "query", required: true, schema: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$" }, description: "Target contract address for the transaction" },
+            { name: "chain", in: "query", required: false, schema: { type: "string", default: "base" }, description: "Chain identifier" },
+            { name: "token", in: "query", required: false, schema: { type: "string" }, description: "Token address involved (optional)" },
+            { name: "counterparty", in: "query", required: false, schema: { type: "string" }, description: "Counterparty wallet address (optional)" },
+            { name: "detail", in: "query", required: false, schema: { type: "string", enum: ["full", "standard", "minimal"], default: "full" }, description: "Response detail level" },
+          ],
+          responses: {
+            "200": { description: "Composite safety analysis with proceed recommendation, individual component scores, and hard-blocker flags" },
+            "402": { description: "Payment required" },
+            "400": { description: "Invalid target address" },
+          },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        TrustVerdict: { type: "string", enum: ["SAFE", "MODERATE", "CAUTION", "DANGER"], description: "Overall risk assessment" },
+        Grade: { type: "string", enum: ["A+", "A", "B+", "B", "C+", "C", "D", "F"], description: "Letter grade mapped from numeric score" },
+      },
+    },
+  });
+});
+
 app.get("/health", (req, res) => {
   res.json({
     service: "Sentinel",
