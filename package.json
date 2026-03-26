@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -21,7 +22,10 @@
     "@x402/extensions": "^2.8.0",
     "axios": "^1.13.0",
     "dotenv": "^16.6.0",
-    "express": "^4.22.0"
+    "express": "^4.22.0",
+    "pino": "^8.17.0",
+    "pino-http": "^9.0.0",
+    "pino-pretty": "^10.2.0"
   },
   "keywords": [
     "x402",
@@ -33,5 +37,9 @@
     "base",
     "usdc"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@jest/globals": "^30.3.0",
+    "jest": "^30.3.0"
+  }
 }
