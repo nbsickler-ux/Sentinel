@@ -30,6 +30,18 @@ const app = express();
 app.set("trust proxy", true);   // Render (and most PaaS) sit behind a reverse proxy — trust X-Forwarded-Proto so req.protocol is "https"
 app.use(express.json());
 
+// Favicon — x402scan requires one to avoid OG-image constraint issues during registration
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" rx="20" fill="#1a1a2e"/>
+  <text x="50" y="68" font-size="60" text-anchor="middle" fill="#00d4ff" font-family="Arial,sans-serif" font-weight="bold">S</text>
+</svg>`;
+app.get("/favicon.ico", (_req, res) => {
+  res.type("image/svg+xml").send(FAVICON_SVG);
+});
+app.get("/favicon.svg", (_req, res) => {
+  res.type("image/svg+xml").send(FAVICON_SVG);
+});
+
 // ============================================================
 // CONFIGURATION
 // ============================================================
