@@ -1555,10 +1555,10 @@ app.get("/preflight", async (req, res) => {
     const scores = [];
     const weights = [];
 
-    if (components.protocol.score !== null) { scores.push(components.protocol.score); weights.push(0.35); }
-    if (components.position?.score !== null) { scores.push(components.position.score); weights.push(0.25); }
-    if (components.token?.score !== null)    { scores.push(components.token.score);    weights.push(0.20); }
-    if (components.counterparty?.score !== null) { scores.push(components.counterparty.score); weights.push(0.20); }
+    if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
+    if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
+    if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
+    if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
 
     // Normalize weights to sum to 1.0
     const weightSum = weights.reduce((a, b) => a + b, 0);
@@ -1755,10 +1755,10 @@ if (NETWORK === "base-sepolia") {
       };
 
       const scores = [], weights = [];
-      if (components.protocol.score !== null) { scores.push(components.protocol.score); weights.push(0.35); }
-      if (components.position?.score !== null) { scores.push(components.position.score); weights.push(0.25); }
-      if (components.token?.score !== null)    { scores.push(components.token.score);    weights.push(0.20); }
-      if (components.counterparty?.score !== null) { scores.push(components.counterparty.score); weights.push(0.20); }
+      if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
+      if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
+      if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
+      if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
       const weightSum = weights.reduce((a, b) => a + b, 0);
       const compositeScore = Math.round(scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0));
       const { grade, verdict } = gradeFromScore(compositeScore);
