@@ -7,3 +7,6 @@ node_modules/
 
 # Confidential docs — never commit to public repo
 docs/CONFIDENTIAL-*
+
+# Proprietary scoring engine — never commit to public repo
+lib/scoring-engine/

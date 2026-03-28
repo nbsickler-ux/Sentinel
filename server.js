@@ -35,6 +35,13 @@ import {
   DETAIL_LEVELS,
   VERSION,
 } from "./lib/scoring.js";
+import {
+  scoreProtocolDimensions,
+  scoreCounterpartyDimensions,
+  scorePositionDimensions,
+  computePreflightComposite,
+  CATEGORY_RISK_MAP,
+} from "./lib/scoring-engine/index.js";
 
 dotenv.config();
 
@@ -690,102 +697,30 @@ async function analyzePosition(protocolAddress, userAddress, chain) {
   // Get protocol info from registry
   const normalized = protocolAddress.toLowerCase();
   const protocol = protocolRegistry[normalized];
-
-  // Position-specific risk dimensions
-  const dimensions = {};
-  const riskFlags = [];
-
-  // 1. Protocol Foundation (40%) - derived from protocol trust score
-  dimensions.protocol_trust = {
-    score: protocolScore.trust_score,
-    detail: `Underlying protocol rated ${protocolScore.trust_grade} (${protocolScore.trust_score}/100): ${protocolScore.verdict}`,
-  };
-  if (protocolScore.trust_score < 55) riskFlags.push(`Underlying protocol rated ${protocolScore.trust_grade} - elevated risk`);
-
-  // 2. Protocol Category Risk (20%)
-  const categoryRisk = {
-    "Dexes": 80,
-    "Lending": 75,
-    "Bridge": 45,
-    "Yield Aggregator": 60,
-    "Yield": 55,
-    "CDP": 70,
-    "Liquid Staking": 75,
-    "Derivatives": 55,
-    "Options": 50,
-    "Algo-Stables": 30,
-    "Insurance": 80,
-    "Launchpad": 40,
-    "Farm": 45,
-    "Ponzi": 5,
-  };
   const category = protocol?.category || "Unknown";
-  const catScore = categoryRisk[category] || 50;
-  dimensions.category_risk = {
-    score: catScore,
-    detail: `Category: ${category}. Inherent risk profile: ${catScore >= 70 ? "lower" : catScore >= 50 ? "moderate" : "higher"}.`,
-  };
-  if (catScore < 40) riskFlags.push(`High-risk category: ${category}`);
-  if (category === "Bridge") riskFlags.push("Bridge protocols carry elevated exploit risk");
-  if (category === "Algo-Stables") riskFlags.push("Algorithmic stablecoins have historically high failure rate");
 
-  // 3. TVL Health (20%) - larger TVL = more battle-tested
+  // Fetch TVL data
   const tvl = await getTvlData(protocolAddress);
-  let tvlScore = 50;
-  if (tvl.currentUsd !== null) {
-    if (tvl.currentUsd > 1_000_000_000) tvlScore = 95;
-    else if (tvl.currentUsd > 500_000_000) tvlScore = 85;
-    else if (tvl.currentUsd > 100_000_000) tvlScore = 75;
-    else if (tvl.currentUsd > 10_000_000) tvlScore = 60;
-    else if (tvl.currentUsd > 1_000_000) tvlScore = 45;
-    else tvlScore = 25;
-    if (!tvl.stable) { tvlScore -= 10; riskFlags.push(`TVL volatility: ${tvl.trend30d} in 30 days`); }
-  } else {
-    tvlScore = 30;
-    riskFlags.push("No TVL data available");
-  }
-  dimensions.tvl_health = {
-    score: Math.max(0, tvlScore),
-    detail: tvl.currentUsd ? `TVL: $${(tvl.currentUsd / 1_000_000).toFixed(1)}M. 30d trend: ${tvl.trend30d}` : "TVL data unavailable",
-  };
 
-  // 4. Concentration Risk (20%) - is this position a large % of protocol TVL?
-  // Without on-chain position data we provide a structural assessment
-  let concentrationScore = 65;
-  if (tvl.currentUsd && tvl.currentUsd < 5_000_000) {
-    concentrationScore = 40;
-    riskFlags.push("Low-TVL protocol - individual positions may represent significant share");
-  } else if (tvl.currentUsd && tvl.currentUsd > 100_000_000) {
-    concentrationScore = 85;
-  }
-  dimensions.concentration_risk = {
-    score: concentrationScore,
-    detail: "Structural concentration assessment based on protocol TVL depth",
-  };
-
-  // Weighted composite
-  const weights = { protocol_trust: 0.40, category_risk: 0.20, tvl_health: 0.20, concentration_risk: 0.20 };
-  const compositeScore = Math.round(
-    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
-  );
-  const { grade, verdict } = gradeFromScore(compositeScore);
+  // Delegate scoring to private engine
+  const scored = scorePositionDimensions(protocolScore, category, tvl);
 
   return {
     protocol_address: protocolAddress,
     user_address: userAddress,
     chain,
-    verdict,
-    trust_grade: grade,
-    trust_score: compositeScore,
+    verdict: scored.verdict,
+    trust_grade: scored.grade,
+    trust_score: scored.compositeScore,
     confidence: protocol ? 0.80 : 0.50,
     protocol_info: {
       name: protocol?.name || "Unknown",
-      category: protocol?.category || "Unknown",
+      category,
       underlying_protocol_grade: protocolScore.trust_grade,
     },
-    dimensions,
-    risk_flags: riskFlags,
-    recommendations: generatePositionRecommendations(riskFlags, compositeScore),
+    dimensions: scored.dimensions,
+    risk_flags: scored.riskFlags,
+    recommendations: generatePositionRecommendations(scored.riskFlags, scored.compositeScore),
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
@@ -797,7 +732,7 @@ async function analyzePosition(protocolAddress, userAddress, chain) {
 /**
  * Generate actionable recommendations based on risk flags
  */
-// generatePositionRecommendations imported from lib/scoring.js
+// Scoring functions delegated to lib/scoring-engine/ (private module)
 
 
 // ============================================================
@@ -926,8 +861,6 @@ function checkExploitAssociation(address) {
  */
 async function scoreCounterparty(address, chain) {
   const startTime = Date.now();
-  const dimensions = {};
-  const riskFlags = [];
 
   // Fetch all data in parallel
   const [sanctions, addressSecurity, exploitAssoc] = await Promise.all([
@@ -936,90 +869,16 @@ async function scoreCounterparty(address, chain) {
     Promise.resolve(checkExploitAssociation(address)),
   ]);
 
-  // 1. Sanctions Screening (40%)
-  let sanctionsScore = 95;
-  if (sanctions.sanctioned) {
-    sanctionsScore = 0;
-    riskFlags.push("ADDRESS IS ON OFAC SDN SANCTIONS LIST - DO NOT INTERACT");
-  }
-  if (addressSecurity.available && addressSecurity.is_sanctioned) {
-    sanctionsScore = 0;
-    riskFlags.push("Address flagged as sanctioned by GoPlus");
-  }
-  if (!sanctions.list_loaded) {
-    sanctionsScore = 50;
-    riskFlags.push("Sanctions list not loaded - screening incomplete");
-  }
-  dimensions.sanctions_screening = {
-    score: sanctionsScore,
-    detail: sanctions.sanctioned
-      ? `SANCTIONED on ${sanctions.list}`
-      : `Not found on OFAC SDN list (${sanctions.addresses_indexed} addresses screened)`,
-  };
-
-  // 2. Address Reputation (30%)
-  let reputationScore = 80;
-  if (addressSecurity.available) {
-    if (addressSecurity.is_malicious_address) { reputationScore = 5; riskFlags.push("Flagged as malicious address"); }
-    if (addressSecurity.is_phishing) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with phishing activities"); }
-    if (addressSecurity.is_cybercrime) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with cybercrime"); }
-    if (addressSecurity.is_money_laundering) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with money laundering"); }
-    if (addressSecurity.is_darkweb) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with darkweb transactions"); }
-    if (addressSecurity.is_financial_crime) { reputationScore = Math.min(reputationScore, 20); riskFlags.push("Associated with financial crime"); }
-    if (addressSecurity.is_mixer) { reputationScore = Math.min(reputationScore, 30); riskFlags.push("Associated with mixer/tumbler usage"); }
-    if (addressSecurity.is_blacklisted) { reputationScore = Math.min(reputationScore, 25); riskFlags.push("Address is on blacklist"); }
-  } else {
-    reputationScore = 60; // Unknown = moderate risk
-  }
-  dimensions.address_reputation = {
-    score: reputationScore,
-    detail: addressSecurity.available
-      ? (reputationScore >= 70 ? "No negative reputation signals detected" : "Negative reputation signals detected")
-      : "Address reputation data unavailable",
-  };
-
-  // 3. Exploit Association (20%)
-  let exploitScore = 90;
-  if (exploitAssoc.associated) {
-    exploitScore = 20;
-    riskFlags.push(`Associated with exploited protocol: ${exploitAssoc.protocol_name} (hacked ${exploitAssoc.hack_date || "date unknown"})`);
-  }
-  dimensions.exploit_association = {
-    score: exploitScore,
-    detail: exploitAssoc.associated
-      ? `Associated with ${exploitAssoc.protocol_name} exploit`
-      : "No exploit associations found",
-  };
-
-  // 4. Address Type (10%)
-  let typeScore = 70;
-  if (addressSecurity.available && addressSecurity.is_contract) {
-    typeScore = 60; // Contracts are slightly riskier as counterparties
-    riskFlags.push("Address is a contract, not an EOA");
-  } else if (addressSecurity.available) {
-    typeScore = 80; // EOA is typical
-  }
-  dimensions.address_type = {
-    score: typeScore,
-    detail: addressSecurity.available
-      ? (addressSecurity.is_contract ? "Contract address" : "Externally owned account (EOA)")
-      : "Address type unknown",
-  };
-
-  // Weighted composite
-  const weights = { sanctions_screening: 0.40, address_reputation: 0.30, exploit_association: 0.20, address_type: 0.10 };
-  const compositeScore = Math.round(
-    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
-  );
-  const { grade, verdict } = gradeFromScore(compositeScore);
+  // Delegate scoring to private engine
+  const scored = scoreCounterpartyDimensions(sanctions, addressSecurity, exploitAssoc);
 
   return {
     address,
     chain,
-    verdict,
-    trust_grade: grade,
-    trust_score: compositeScore,
-    confidence: sanctions.list_loaded && addressSecurity.available ? 0.90 : 0.55,
+    verdict: scored.verdict,
+    trust_grade: scored.grade,
+    trust_score: scored.compositeScore,
+    confidence: scored.confidence,
     evidence: {
       sanctions: {
         sanctioned: sanctions.sanctioned,
@@ -1035,8 +894,8 @@ async function scoreCounterparty(address, chain) {
       } : { available: false },
       exploit_association: exploitAssoc,
     },
-    dimensions,
-    risk_flags: riskFlags,
+    dimensions: scored.dimensions,
+    risk_flags: scored.riskFlags,
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
@@ -1064,146 +923,19 @@ async function scoreProtocol(contractAddress, chain) {
     getTvlData(contractAddress),
   ]);
 
-  // Score each dimension (0-100)
-  const dimensions = {};
-
-  // Audit (25%)
-  if (audit.audited) {
-    let score = 80;
-    if (audit.auditors.length >= 2) score += 10;
-    if (audit.monthsSinceAudit && audit.monthsSinceAudit < 6) score += 5;
-    if (audit.monthsSinceAudit && audit.monthsSinceAudit > 18) score -= 15;
-    dimensions.audit = { score: Math.min(100, Math.max(0, score)), detail: `Audited by ${audit.auditors.join(", ")}. Last audit: ${audit.monthsSinceAudit} months ago.` };
-  } else {
-    dimensions.audit = { score: 15, detail: "No audit records found." };
-  }
-
-  // Exploit history (25%)
-  if (exploits.exploited) {
-    const resolved = exploits.incidents.every(i => i.resolved);
-    dimensions.exploit_history = {
-      score: resolved ? 35 : 5,
-      detail: `${exploits.incidents.length} exploit(s) on record. ${resolved ? "All resolved." : "Unresolved incidents."}`,
-    };
-  } else {
-    dimensions.exploit_history = { score: 90, detail: "No exploit history found." };
-  }
-
-  // Contract maturity (15%)
-  let contractScore = 50;
-  if (contract.ageDays && contract.ageDays > 365) contractScore += 20;
-  if (contract.ageDays && contract.ageDays > 180) contractScore += 10;
-  if (contract.verifiedSource) contractScore += 10;
-  if (contract.ownerIsMultisig) contractScore += 10;
-  dimensions.contract_maturity = {
-    score: Math.min(100, contractScore),
-    detail: contract.mock
-      ? "Using estimated contract data (mock mode)"
-      : `Contract age: ${contract.ageDays} days. Source verified: ${contract.verifiedSource}. Multisig: ${contract.ownerIsMultisig}.`,
-  };
-
-  // TVL stability (15%)
-  if (tvl.currentUsd !== null) {
-    let tvlScore = 60;
-    if (tvl.currentUsd > 1_000_000_000) tvlScore += 25;
-    else if (tvl.currentUsd > 100_000_000) tvlScore += 15;
-    else if (tvl.currentUsd > 10_000_000) tvlScore += 5;
-    if (tvl.stable) tvlScore += 10;
-    dimensions.tvl_stability = { score: Math.min(100, tvlScore), detail: `TVL: $${(tvl.currentUsd / 1_000_000).toFixed(0)}M. 30d trend: ${tvl.trend30d}. ${tvl.stable ? "Stable." : "Volatile."}` };
-  } else {
-    dimensions.tvl_stability = { score: 40, detail: "TVL data unavailable." };
-  }
-
-  // Governance risk (10%) - based on registry metadata
+  // Get protocol metadata from registry
   const protocolMeta = protocolRegistry[contractAddress.toLowerCase()] || {};
-  {
-    let govScore = 50; // baseline
-    const govDetails = [];
 
-    if (protocolMeta.governanceID) {
-      govScore += 25; // Has on-chain/snapshot governance
-      govDetails.push("Active governance system detected");
-    }
-    if (protocolMeta.treasury) {
-      govScore += 10; // Has a treasury (DAO structure)
-      govDetails.push("Protocol treasury exists");
-    }
-    if (contract.ownerIsMultisig) {
-      govScore += 10; // Multisig ownership = decentralized control
-      govDetails.push("Multisig ownership");
-    }
-    if (protocolMeta.openSource) {
-      govScore += 5;
-      govDetails.push("Open source");
-    }
-
-    dimensions.governance = {
-      score: Math.min(100, Math.max(0, govScore)),
-      detail: govDetails.length > 0 ? govDetails.join(". ") + "." : "No governance signals available.",
-    };
-  }
-
-  // Community signal (10%) - based on ecosystem presence
-  {
-    let commScore = 40; // baseline
-    const commDetails = [];
-
-    if (protocolMeta.twitter) {
-      commScore += 10;
-      commDetails.push("Social presence verified");
-    }
-    if (protocolMeta.url) {
-      commScore += 5;
-      commDetails.push("Active website");
-    }
-    if (protocolMeta.listedAt) {
-      // Longer listing on DeFiLlama = more established community
-      const listedDaysAgo = (Date.now() / 1000 - protocolMeta.listedAt) / 86400;
-      if (listedDaysAgo > 730) { commScore += 20; commDetails.push("Established for 2+ years"); }
-      else if (listedDaysAgo > 365) { commScore += 15; commDetails.push("Established for 1+ year"); }
-      else if (listedDaysAgo > 90) { commScore += 5; commDetails.push("Listed for 3+ months"); }
-    }
-    if (protocolMeta.mcap && protocolMeta.mcap > 100_000_000) {
-      commScore += 15;
-      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
-    } else if (protocolMeta.mcap && protocolMeta.mcap > 10_000_000) {
-      commScore += 10;
-      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
-    }
-    if (protocolMeta.forkedFrom && protocolMeta.forkedFrom.length > 0) {
-      commScore += 5; // Fork of established protocol
-      commDetails.push(`Fork of ${protocolMeta.forkedFrom[0]}`);
-    }
-
-    dimensions.community = {
-      score: Math.min(100, Math.max(0, commScore)),
-      detail: commDetails.length > 0 ? commDetails.join(". ") + "." : "No community signals available.",
-    };
-  }
-
-  // Compute composite
-  const weights = { audit: 0.25, exploit_history: 0.25, contract_maturity: 0.15, tvl_stability: 0.15, governance: 0.10, community: 0.10 };
-  const compositeScore = Math.round(
-    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
-  );
-
-  // Identify risk flags
-  const riskFlags = [];
-  if (!audit.audited) riskFlags.push("No audit records found - high risk");
-  if (exploits.exploited) riskFlags.push(`Previous exploit: ${exploits.incidents[0]?.type || "unknown type"}`);
-  if (contract.proxyPattern) riskFlags.push(`Proxy contract (${contract.proxyPattern}) - admin upgrade possible`);
-  if (audit.monthsSinceAudit && audit.monthsSinceAudit > 12) riskFlags.push(`Audit is ${audit.monthsSinceAudit} months old - may not reflect current code`);
-  if (tvl.currentUsd !== null && tvl.currentUsd < 10_000_000) riskFlags.push("TVL below $10M - limited liquidity");
-
-  const { grade, verdict } = gradeFromScore(compositeScore);
+  // Delegate scoring to private engine
+  const scored = scoreProtocolDimensions(audit, exploits, contract, tvl, protocolMeta);
 
   return {
     address: contractAddress,
     chain,
-    verdict,
-    trust_grade: grade,
-    trust_score: compositeScore,
-    confidence: contract.mock ? 0.45 : 0.88,
+    verdict: scored.verdict,
+    trust_grade: scored.grade,
+    trust_score: scored.compositeScore,
+    confidence: scored.confidence,
     evidence: {
       audit: {
         audited: audit.audited,
@@ -1227,8 +959,8 @@ async function scoreProtocol(contractAddress, chain) {
         stable: tvl.stable,
       },
     },
-    dimensions,
-    risk_flags: riskFlags,
+    dimensions: scored.dimensions,
+    risk_flags: scored.riskFlags,
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
@@ -1721,61 +1453,26 @@ app.post("/preflight", async (req, res) => {
       } : null,
     };
 
-    // Compute composite score — weighted by what checks were actually run
-    // Protocol is always heaviest; others scale if present
-    const scores = [];
-    const weights = [];
-
-    if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
-    if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
-    if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
-    if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
-
-    // Normalize weights to sum to 1.0
-    const weightSum = weights.reduce((a, b) => a + b, 0);
-    const compositeScore = Math.round(
-      scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0)
-    );
-    const { grade, verdict } = gradeFromScore(compositeScore);
-
-    // Aggregate all risk flags
-    const allRiskFlags = [
-      ...(components.protocol.risk_flags || []),
-      ...(components.token?.risk_flags || []),
-      ...(components.counterparty?.risk_flags || []),
-      ...(components.position?.risk_flags || []),
-    ];
-
-    // Hard blockers: sanctions or honeypot override the composite
-    const hardBlock = allRiskFlags.some(f =>
-      f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED")
-    );
-    const finalVerdict = hardBlock ? "DANGER" : verdict;
-    const finalGrade = hardBlock ? "F" : grade;
-    const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
-
-    // Proceed recommendation
-    const proceed = !hardBlock && finalScore >= 40;
+    // Delegate composite scoring to private engine
+    const preflight = computePreflightComposite(components);
 
     const result = {
       target,
       token: token || null,
       counterparty: counterparty || null,
       chain,
-      verdict: finalVerdict,
-      trust_grade: finalGrade,
-      composite_score: finalScore,
-      proceed,
-      proceed_recommendation: proceed
-        ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags")
-        : "DO NOT PROCEED — elevated risk detected",
+      verdict: preflight.verdict,
+      trust_grade: preflight.grade,
+      composite_score: preflight.compositeScore,
+      proceed: preflight.proceed,
+      proceed_recommendation: preflight.proceedRecommendation,
       checks_summary: {
         protocol: components.protocol.grade,
         token: components.token?.grade || "not_checked",
         counterparty: components.counterparty?.grade || "not_checked",
         position: components.position?.grade || "not_checked",
       },
-      risk_flags: allRiskFlags,
+      risk_flags: preflight.allRiskFlags,
       components: detailLevel === "minimal" ? undefined : components,
       recommendations: positionResult?.recommendations || [],
       meta: {
@@ -2181,27 +1878,15 @@ if (NETWORK === "base-sepolia") {
         position: positionResult ? { verdict: positionResult.verdict, grade: positionResult.trust_grade, score: positionResult.trust_score, risk_flags: positionResult.risk_flags, recommendations: positionResult.recommendations } : null,
       };
 
-      const scores = [], weights = [];
-      if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
-      if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
-      if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
-      if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
-      const weightSum = weights.reduce((a, b) => a + b, 0);
-      const compositeScore = Math.round(scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0));
-      const { grade, verdict } = gradeFromScore(compositeScore);
-
-      const allRiskFlags = [...(components.protocol.risk_flags || []), ...(components.token?.risk_flags || []), ...(components.counterparty?.risk_flags || []), ...(components.position?.risk_flags || [])];
-      const hardBlock = allRiskFlags.some(f => f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED"));
-      const finalVerdict = hardBlock ? "DANGER" : verdict;
-      const finalGrade = hardBlock ? "F" : grade;
-      const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
-      const proceed = !hardBlock && finalScore >= 40;
+      // Delegate composite scoring to private engine
+      const preflight = computePreflightComposite(components);
 
       const result = {
-        target, token: token || null, counterparty: counterparty || null, chain, verdict: finalVerdict, trust_grade: finalGrade, composite_score: finalScore, proceed,
-        proceed_recommendation: proceed ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags") : "DO NOT PROCEED — elevated risk detected",
+        target, token: token || null, counterparty: counterparty || null, chain,
+        verdict: preflight.verdict, trust_grade: preflight.grade, composite_score: preflight.compositeScore, proceed: preflight.proceed,
+        proceed_recommendation: preflight.proceedRecommendation,
         checks_summary: { protocol: components.protocol.grade, token: components.token?.grade || "not_checked", counterparty: components.counterparty?.grade || "not_checked", position: components.position?.grade || "not_checked" },
-        risk_flags: allRiskFlags, components, recommendations: positionResult?.recommendations || [],
+        risk_flags: preflight.allRiskFlags, components, recommendations: positionResult?.recommendations || [],
         meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION, checks_run: ["protocol", token ? "token" : null, counterparty ? "counterparty" : null, "position"].filter(Boolean) },
       };
       const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
