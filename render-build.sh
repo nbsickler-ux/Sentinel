@@ -39,7 +39,7 @@ node --check lib/scoring-engine/index.js
 echo "==> Scoring engine syntax OK"
 
 # 3. Install dependencies
-npm ci
+npm install
 echo "==> Dependencies installed"
 
 echo "==> Sentinel build complete"
