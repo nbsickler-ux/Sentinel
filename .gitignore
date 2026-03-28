@@ -4,3 +4,6 @@ node_modules/
 *.log
 .DS_Store
 .~lock.*
+
+# Confidential docs — never commit to public repo
+docs/CONFIDENTIAL-*
