@@ -10,3 +10,4 @@ docs/CONFIDENTIAL-*
 
 # Proprietary scoring engine — never commit to public repo
 lib/scoring-engine/
+scoring-engine-b64.txt
