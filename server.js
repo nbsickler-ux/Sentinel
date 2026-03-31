@@ -42,6 +42,9 @@ import {
   computePreflightComposite,
   CATEGORY_RISK_MAP,
 } from "./lib/scoring-engine/index.js";
+import { initPool, runMigrations } from "./lib/db.js";
+import { createRequestLogger } from "./lib/request-logger.js";
+import { createAdminRouter } from "./lib/admin-stats.js";
 
 dotenv.config();
 
@@ -1236,6 +1239,25 @@ app.use(PAID_PATHS, async (req, res, next) => {
 
 
 // ============================================================
+// REQUEST LOGGING MIDDLEWARE (non-blocking, fail-silent)
+// Logs every paid + discovery request to Postgres request_log
+// ============================================================
+
+app.use(createRequestLogger({
+  alchemyApiKey: ALCHEMY_API_KEY,
+  network: NETWORK,
+}));
+
+
+// ============================================================
+// ADMIN ROUTES (protected by SENTINEL_ADMIN_KEY)
+// ============================================================
+
+const SENTINEL_ADMIN_KEY = process.env.SENTINEL_ADMIN_KEY || "";
+app.use("/admin", createAdminRouter(SENTINEL_ADMIN_KEY));
+
+
+// ============================================================
 // API ENDPOINTS
 // ============================================================
 
@@ -1906,7 +1928,7 @@ if (NETWORK === "base-sepolia") {
 // ============================================================
 // START
 // ============================================================
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   const facType = (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "CDP (Coinbase)" : "x402.org";
   logger.info({
     version: VERSION,
@@ -1916,6 +1938,18 @@ app.listen(PORT, () => {
     cache: redis ? "enabled" : "disabled",
     service: "sentinel",
   }, "SENTINEL server started — The Trust Layer for Autonomous Agents");
+
+  // Initialize Postgres for request logging (non-fatal if unavailable)
+  const DATABASE_URL = process.env.DATABASE_URL || "";
+  const dbPool = initPool(DATABASE_URL, logger);
+  if (dbPool) {
+    try {
+      await runMigrations(logger);
+      logger.info({ module: "db" }, "Request logging enabled (Postgres)");
+    } catch (e) {
+      logger.warn({ module: "db", err: e.message }, "Postgres migration failed — request logging disabled");
+    }
+  }
 });
 
 // ============================================================
