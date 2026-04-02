@@ -1,0 +1,323 @@
+
+CLAUDE CODE ENGINEERING BRIEF
+Phase 2: Agent Reputation Registry (ERC-8004 Aligned)
+Date: April 2, 2026
+For: Claude Code execution
+From: Opus strategy session (Cowork)
+
+HARD CONSTRAINT: Do NOT read .env files. Do NOT read, copy, move, or log API keys. The existing code loads keys from environment variables at runtime — your code uses process.env references, never the keys directly. This applies to all models and tools.
+
+Pre-Requisite: Phase 0 (caching) and Phase 1 (EAS attestations) must be complete before starting Phase 2. This phase builds on the EAS infrastructure.
+
+Mission
+Build an agent reputation system that tracks how agents interact with Sentinel over time. Returning agents with good history get faster, cheaper verification. Unknown agents get full-depth checks. This replaces the current model where every caller is treated identically regardless of history.
+
+The system is aligned with ERC-8004 (Agent Trust Protocol), a proposed standard for on-chain agent identity and reputation. We don't implement ERC-8004 directly (the standard is still in draft), but we design our data model to be forward-compatible so we can adopt the standard when it finalizes.
+
+Strategic Context: Anti-Overfit Guardrails
+Reputation passes the net load test:
+  - REDUCES: Trusted agents skip some checks (e.g., skip OFAC re-screening for a counterparty that was clean 2 hours ago)
+  - REPLACES: Repeated verification depth with a reputation score
+  - NO NEW SPOF: Reputation is stored in Redis + EAS (same infrastructure as Phase 0-1)
+
+Architecture Overview
+
+Three reputation tiers with different verification depths:
+
+  UNKNOWN (default) — Full verification depth
+    - All API calls executed
+    - All checks at maximum depth
+    - This is current behavior — no degradation
+
+  RECOGNIZED — Moderate verification depth
+    - Criteria: 5+ paid verifications, 0 flagged transactions in last 30 days
+    - Benefits: Skip OFAC re-check if last check was <24h ago, reduced Etherscan depth (skip age re-computation if cached), preflight cache TTL extended to 10 min (from 5 min)
+    - Net effect: ~30% fewer API calls per request
+
+  TRUSTED — Minimum viable verification depth
+    - Criteria: 20+ paid verifications, 0 flagged transactions in last 90 days, verified through ERC-8004 registry (when available)
+    - Benefits: All RECOGNIZED benefits + skip contract metadata re-fetch if attestation <48h old, preflight cache TTL extended to 15 min, priority queue (future)
+    - Net effect: ~50% fewer API calls per request
+
+IMPORTANT: Reputation NEVER skips the final scoring step. It only reduces the NUMBER of upstream API calls by extending cache TTLs and reusing recent attestations. The scoring engine always runs with whatever data is available. A TRUSTED agent hitting a suspicious new contract still gets full scrutiny — reputation applies to the agent, not to the target.
+
+What Already Exists (After Phase 0 + 1)
+  - Redis caching with configurable TTLs (Phase 0)
+  - EAS attestations recording every verification (Phase 1)
+  - x402 payment middleware that authenticates callers by their wallet address
+  - Rate limiting per wallet (25 free calls/day)
+  - The payment middleware exposes the payer's wallet address — this is the agent's identity
+
+Build 1: Agent Profile Storage (lib/reputation/store.js)
+
+Agent profiles are stored in Redis with the following structure:
+
+Key: sentinel:agent:{walletAddress}
+Value (JSON):
+  {
+    wallet: "0x...",
+    tier: "unknown",              // "unknown" | "recognized" | "trusted"
+    total_verifications: 0,       // Lifetime count of paid verifications
+    verifications_30d: 0,         // Rolling 30-day count
+    flagged_transactions: 0,      // Count of verifications where agent's counterparty was UNSAFE
+    last_verification: null,      // ISO timestamp
+    last_ofac_check: null,        // ISO timestamp of most recent clean OFAC screen
+    first_seen: "2026-04-02T...", // When this agent first used Sentinel
+    tier_updated: null,           // When tier last changed
+    metadata: {}                  // Reserved for ERC-8004 fields
+  }
+
+TTL: None (agent profiles persist indefinitely in Redis). If Redis data is lost, agents start over as UNKNOWN — this is acceptable.
+
+Exports:
+  - getAgentProfile(walletAddress) — Returns profile or creates default UNKNOWN profile
+  - updateAgentProfile(walletAddress, verificationResult) — Increment counters, recalculate tier
+  - getAgentTier(walletAddress) — Quick tier lookup (used on hot path)
+  - recalculateTier(profile) — Pure function: given a profile, return the correct tier
+
+recalculateTier logic:
+  function recalculateTier(profile) {
+    if (profile.total_verifications >= 20 &&
+        profile.flagged_transactions === 0 &&
+        profile.verifications_30d >= 5) {
+      return "trusted";
+    }
+    if (profile.total_verifications >= 5 &&
+        profile.flagged_transactions === 0) {
+      return "recognized";
+    }
+    return "unknown";
+  }
+
+Note: The 90-day clean history requirement for TRUSTED is simplified to flagged_transactions === 0 for now. When we have enough data to track per-period flags, we can tighten this.
+
+updateAgentProfile logic:
+  - Increment total_verifications
+  - Update last_verification timestamp
+  - If the verification result contained UNSAFE verdict or OFAC flags → increment flagged_transactions
+  - If the verification included a clean OFAC screen → update last_ofac_check
+  - Recalculate tier
+  - If tier changed, update tier_updated timestamp and log the change
+  - Write back to Redis
+
+Rolling 30-day count:
+  - Simple approach: Store a Redis sorted set sentinel:agent:{wallet}:history with timestamps as scores. On each verification, ZADD the timestamp. On tier recalculation, ZRANGEBYSCORE to count entries in last 30 days. ZREMRANGEBYSCORE to prune entries older than 90 days.
+  - This gives us accurate rolling windows without complex time-bucketing.
+
+Build 2: Tier-Aware Cache TTLs (lib/reputation/tiers.js)
+
+Export a function that returns cache TTLs based on agent tier:
+
+  // NOTE: These base values MUST match the CACHE_TTL object in server.js (set up in Phase 0).
+  // This function returns overrides — import the actual CACHE_TTL from server.js as the source of truth,
+  // or read the values at runtime. Do NOT hardcode a second copy.
+  function getTierCacheTTLs(tier, baseTTLs = CACHE_TTL) {
+    const base = { ...baseTTLs };
+
+    if (tier === "recognized") {
+      return {
+        ...base,
+        preflight: 600,       // 10 min (extended)
+        counterparty: 1800,   // 30 min (OFAC less frequent)
+      };
+    }
+
+    if (tier === "trusted") {
+      return {
+        ...base,
+        preflight: 900,       // 15 min (extended)
+        counterparty: 3600,   // 1 hour
+        contractMetadata: 172800, // 48h (extended)
+      };
+    }
+
+    return base; // unknown
+  }
+
+Also export:
+  function shouldSkipOfacRecheck(profile) {
+    if (!profile.last_ofac_check) return false;
+    const hoursSinceCheck = (Date.now() - new Date(profile.last_ofac_check).getTime()) / (1000 * 60 * 60);
+    if (profile.tier === "recognized" && hoursSinceCheck < 24) return true;
+    if (profile.tier === "trusted" && hoursSinceCheck < 48) return true;
+    return false;
+  }
+
+Build 3: Integration into server.js
+
+Modify the verification endpoints to be reputation-aware.
+
+Step 1: Extract agent wallet from payment context
+  The x402 payment middleware processes payments before the handler runs. After payment, the payer's wallet address should be available. Examine the x402 middleware to find where the payer's address is stored. Common patterns:
+  - req.x402.payer
+  - req.payment.from
+  - Extracted from the payment header
+
+  Search the x402 package source or documentation to find the correct field. If the payer address is not directly available in the request object, it may need to be extracted from the payment verification result.
+
+  Create a helper. IMPORTANT: You must READ the x402 middleware integration in server.js to find the exact field. Look at how the payment middleware attaches payer info to the request object. Check around line 1271 where PAID_PATHS middleware is defined, and look at what fields the x402 middleware adds to `req`. Common patterns include req.x402?.payer, req.payment?.from, or the payer address may be extracted from payment headers. Verify before coding.
+
+  KNOWN ISSUE: The existing admin stats (lib/admin-stats.js, lib/request-logger.js) log `caller_wallet` but are currently storing IP addresses (e.g., "79.137.72.94", "::1") instead of x402 payer wallets. This means the request logger is using req.ip as a fallback when no wallet is found. Your getPayerWallet() implementation must find the ACTUAL wallet from x402 payment context — do not repeat the IP fallback pattern. If the x402 middleware doesn't expose the payer wallet in an obvious way, check the x402 payment verification response object, the decoded payment header, or the facilitator response.
+
+  function getPayerWallet(req) {
+    // VERIFY THIS — read the x402 middleware to find correct field
+    return req.x402?.payer || req.payment?.from || null;
+  }
+
+Step 2: Load agent profile on each paid request
+  In each paid endpoint handler, after the x402 middleware runs:
+
+  const payerWallet = getPayerWallet(req);
+  const agentProfile = payerWallet ? await getAgentProfile(payerWallet) : null;
+  const tier = agentProfile?.tier || "unknown";
+  const tierTTLs = getTierCacheTTLs(tier);
+
+Step 3: Use tier-aware TTLs
+  Replace hardcoded CACHE_TTL references with tierTTLs:
+
+  BEFORE:
+    cachedCall(cacheKey, CACHE_TTL.protocol, () => scoreProtocol(...))
+  AFTER:
+    cachedCall(cacheKey, tierTTLs.protocol, () => scoreProtocol(...))
+
+  For /preflight:
+    cachedCall(cacheKey, tierTTLs.preflight, async () => { ... })
+
+Step 4: OFAC skip for recognized/trusted agents
+  In scoreCounterparty() (line 904), before the sanctions check:
+
+  // If the calling agent has a recent clean OFAC screen, skip re-check
+  // The agentProfile needs to be passed through the call chain or stored in request context
+  // Simplest: use AsyncLocalStorage or pass as parameter
+
+  Cleanest approach: Add an optional parameter to scoreCounterparty:
+    async function scoreCounterparty(address, chain, skipOfac = false)
+
+  If skipOfac is true, set the sanctions result to { sanctioned: false, list: null, list_loaded: true, degraded: false, skipped: true, reason: "agent_reputation" }.
+
+  In the endpoint handler, determine skipOfac:
+    const skipOfac = agentProfile ? shouldSkipOfacRecheck(agentProfile) : false;
+
+Step 5: Update agent profile after each verification
+  After sending the response (same pattern as attestation writes — fire and forget):
+
+  if (payerWallet) {
+    updateAgentProfile(payerWallet, {
+      verdict: result.verdict,
+      riskFlags: result.risk_flags || [],
+      ofacClean: !result.risk_flags?.includes("OFAC_SCREENING_UNAVAILABLE") && !result.risk_flags?.includes("SANCTIONED"),
+    }).catch(err => logger.error({ err, wallet: payerWallet }, "Agent profile update failed"));
+  }
+
+Build 4: Agent Profile Endpoint (New)
+
+Add a new FREE endpoint:
+
+GET /agent/:walletAddress
+  - Returns the agent's reputation profile (public information only)
+  - Response:
+    {
+      wallet: "0x...",
+      tier: "recognized",
+      total_verifications: 12,
+      first_seen: "2026-03-15T...",
+      last_verification: "2026-04-02T...",
+      meta: {
+        sentinel_version: VERSION,
+        erc8004_compatible: false,  // Will become true when ERC-8004 ships
+      }
+    }
+  - Note: Do NOT expose flagged_transactions count or detailed history. Only tier and aggregate stats.
+  - Rate limit: 50 calls per IP per hour.
+
+Build 5: Reputation in Response Metadata
+
+Add reputation context to all paid endpoint responses in the meta object:
+
+  meta: {
+    ...existingMeta,
+    agent_tier: tier,
+    cache_ttl_applied: tierTTLs.protocol,  // whichever TTL was used
+    ofac_skipped: skipOfac || false,
+  }
+
+This lets agents see their own reputation tier and understand why they got a faster/slower response.
+
+Build 6: ERC-8004 Forward Compatibility
+
+ERC-8004 (Agent Trust Protocol) proposes a standard for on-chain agent identity. Key concepts:
+  - Agent Registry: A contract where agents register with their wallet + metadata
+  - Trust Scores: On-chain reputation scores issued by trust providers (like Sentinel)
+  - Delegation: Agents can delegate trust checks to services
+
+We don't implement ERC-8004 now, but we prepare:
+
+  1. In lib/reputation/store.js, the `metadata` field in the agent profile is reserved for ERC-8004 fields:
+     metadata: {
+       erc8004_registered: false,    // Will check on-chain registry when available
+       erc8004_agent_id: null,       // Will be the on-chain agent ID
+       erc8004_trust_score: null,    // Will be Sentinel's issued trust score
+     }
+
+  2. In lib/eas/config.js, add a comment block:
+     // ERC-8004 COMPATIBILITY NOTES
+     // When ERC-8004 finalizes, Sentinel will:
+     // 1. Check the Agent Registry contract to verify agent identity
+     // 2. Issue on-chain trust scores via the Trust Score interface
+     // 3. Accept delegated trust checks from registered agents
+     // 4. Map our tier system to ERC-8004 trust levels
+     // Tracking: https://eips.ethereum.org/EIPS/eip-8004
+
+  3. In the /agent/:walletAddress response, include erc8004_compatible: false in meta. This flag will flip to true when we integrate.
+
+Expected File Structure
+
+New files:
+  lib/reputation/store.js       — Agent profile CRUD (Redis-backed)
+  lib/reputation/tiers.js       — Tier definitions, TTL calculations, OFAC skip logic
+  lib/reputation/README.md      — Brief documentation
+
+Modified files:
+  server.js                     — Import reputation modules, tier-aware TTLs, agent profile endpoint, response metadata
+  lib/eas/config.js             — ERC-8004 compatibility notes
+
+No new npm dependencies. All storage uses existing Redis (Upstash).
+
+Testing Checklist
+  1. Start the server. Verify reputation modules load without errors.
+  2. Hit /verify/protocol with a paid request. Verify:
+     - meta.agent_tier shows "unknown" (first request)
+     - Agent profile is created in Redis
+  3. Hit GET /agent/:walletAddress. Verify the profile shows total_verifications: 1.
+  4. Hit 4 more paid requests. Verify total_verifications increments to 5.
+  5. Verify tier is now "recognized" (5+ verifications, 0 flags).
+  6. Hit /verify/counterparty. Verify meta.ofac_skipped is false (first counterparty check for this agent).
+  7. Hit the same /verify/counterparty again within 24 hours. Verify meta.ofac_skipped is true (recognized agent, recent clean screen).
+  8. Verify /preflight cache TTL is 10 min for recognized agent (vs 5 min for unknown).
+  9. Run npm test — all existing tests pass.
+  10. Verify that if Redis is down, all endpoints still work (reputation defaults to "unknown", standard TTLs apply).
+
+What Not To Do
+  - Do NOT skip the scoring engine for any tier. Reputation only adjusts cache TTLs and OFAC frequency.
+  - Do NOT store sensitive information in the agent profile (private keys, payment details, etc.).
+  - Do NOT make reputation a hard dependency. If reputation lookup fails, default to "unknown" tier.
+  - Do NOT implement ERC-8004 on-chain integration yet. Only prepare the data model.
+  - Do NOT modify lib/scoring-engine/index.js.
+  - Do NOT add new npm dependencies.
+  - Do NOT read .env files or log keys.
+  - Do NOT expose flagged_transactions or internal metrics via the public /agent endpoint.
+  - Do NOT let reputation affect the VERDICT or SCORE — only the speed and depth of data collection.
+
+Build Sequence
+  1. Read the x402 middleware source to find where payer wallet address is available after payment.
+  2. Create lib/reputation/store.js — agent profile CRUD with Redis.
+  3. Create lib/reputation/tiers.js — tier calculations and TTL maps.
+  4. Integrate into server.js — extract payer wallet, load profile, use tier TTLs.
+  5. Add OFAC skip logic to scoreCounterparty().
+  6. Add post-response profile updates to all paid endpoints.
+  7. Add GET /agent/:walletAddress endpoint.
+  8. Add reputation metadata to all paid endpoint responses.
+  9. Test tier progression: unknown → recognized → trusted.
+  10. Run npm test and verify no regressions.
+
+EXPECTED OUTCOME: After this phase, agents that use Sentinel regularly get progressively faster responses. A RECOGNIZED agent's /preflight resolves ~30% faster due to extended cache TTLs and OFAC skip. A TRUSTED agent is ~50% faster. New/unknown agents see no change — they get the same full-depth verification as today. This creates a natural incentive loop: agents pay for verifications → build reputation → get faster service → use Sentinel more.

@@ -1,0 +1,138 @@
+CLAUDE CODE ENGINEERING BRIEF
+Directional Signal Parameter Sweep
+April 1, 2026
+Handoff from Opus strategy session to Claude Code execution
+HARD CONSTRAINT: Do not read .env files. Do not copy, move, or display API keys. Do not touch credentials in any form. If a task requires an API key, stop and ask the user. This constraint is absolute and non-negotiable.
+
+MISSION: Build a parameter sweep runner for directional signals. Run it. Save all results to Postgres. The goal is to find parameter combinations that push ETH/USDC and cbBTC/USDC directional signals past the graduation criteria for Phase 3 paper trading.
+
+Context: What You Already Built
+In the previous session, you built the backfill pipeline (src/backfill/) and backtesting harness (src/backtest/). The first backtest run produced these results:
+Signal
+Trades
+Hit Rate
+Avg P&L
+Sharpe
+PF
+Verdict
+Dir: cbBTC/USDC
+393
+32.3%
+-27.4 bps
+-3.86
+0.51
+FAIL
+Dir: ETH/USDC
+398
+38.2%
+-18.3 bps
+-2.06
+0.56
+CLOSEST
+
+Key finding: 97% of exits hit the time limit (4 hours). Barriers are not being triggered. The thesis isn’t wrong — the parameters are miscalibrated for hourly candle data. This is a tuning problem.
+What To Build
+1. Parameter Sweep Runner
+New file: src/backtest/sweep.js
+A script that runs the existing backtestDirectional() function across a grid of parameter combinations, saves every result to the backtest_results table, and outputs a sorted summary.
+Parameter Grid
+Parameter
+Current Value
+Sweep Values
+Rationale
+time_limit
+4 hours
+8h, 12h, 24h, 48h
+97% of exits hit time limit. Need wider window.
+take_profit
+(current default)
+1%, 2%, 3%, 5%, 8%
+Widen to let winners run.
+stop_loss
+(current default)
+1%, 2%, 3%, 5%
+Test tighter and wider stops.
+confidence_threshold
+(current default)
+0.3, 0.4, 0.5, 0.6
+Filter weak signals.
+
+Total combinations: 4 time limits × 5 take profits × 4 stop losses × 4 confidence thresholds = 320 per pair. Two pairs = 640 total backtests.
+Run time estimate: Each backtest processes ~2,100–4,300 historical data points through the signal engine. At ~10–50ms per backtest, the full sweep should complete in under 1 minute.
+Output Format
+Every combination gets a row in backtest_results with the params stored in the JSONB params column. After all runs complete, print a summary table sorted by Sharpe ratio (descending), showing the top 20 results for each pair. Include: pair, time_limit, take_profit, stop_loss, confidence_threshold, trades, hit_rate, avg_pnl_bps, sharpe, max_drawdown, profit_factor, and whether it passes graduation.
+CLI Interface
+npm run sweep  —  runs the full grid for both pairs
+npm run sweep -- --pair=ETH/USDC  —  single pair
+npm run sweep -- --top=50  —  show top 50 results instead of 20
+
+Graduation Criteria
+A parameter combination graduates when ALL of the following pass:
+Criterion
+Threshold
+Why
+Expected value
+avg_pnl_bps > 0
+Must be profitable on average after fees
+Sharpe ratio
+> 1.0
+Risk-adjusted return must justify the volatility
+Max drawdown
+< 15%
+Capital preservation constraint
+Hit rate
+> 40%
+Enough wins to be psychologically tradeable
+Profit factor
+> 1.5
+Wins must meaningfully outweigh losses
+Minimum trades
+30+
+Statistical significance floor
+
+The checkGraduation() function in src/backtest/metrics.js already implements these checks. Use it directly. Add the graduation boolean to the sweep output.
+What Already Exists (Do Not Rebuild)
+	•	src/backtest/harness.js — backtestDirectional() accepts params. Use it as-is.
+	•	src/backtest/simulator.js — Triple Barrier simulator with fee model. Already handles variable take_profit, stop_loss, time_limit.
+	•	src/backtest/metrics.js — computeMetrics() and checkGraduation(). Use them.
+	•	src/backtest/loader.js — loads historical data from Postgres. Use it.
+	•	backtest_results table (migration v5) — stores results with params JSONB. Write to it.
+Check how backtestDirectional() currently accepts parameters. It may already support the full parameter set via an options object, or it may need a small modification to accept time_limit, take_profit, stop_loss, and confidence_threshold as overrides. Modify the minimum necessary to enable the sweep.
+
+Secondary Tasks (After Sweep Completes)
+2. Arb Fee Tier Check
+Quick investigation: is the cbBTC/USDC pool on Aerodrome configured as a stable pair (0.01% fee) or volatile pair (0.30% fee)? Check the pool contract at 0x4e962bb3. If it’s stable, re-run the arb backtest with the corrected fee (round-trip drops from ~93bps to ~64bps) and report whether the results change meaningfully.
+How to check: read the pool’s stable() boolean via Alchemy RPC call, or check the Aerodrome subgraph poolDayData for the fee tier field. Do not use any API keys that aren’t already in the environment.
+3. Exit Analysis
+For the top 5 graduating parameter combinations (or top 5 overall if none graduate), produce a breakdown of exit types: what percentage hit stop loss vs take profit vs time limit? This tells us whether the barriers are actually being used or if we’re still in time-limit-dominated territory.
+4. Summary Report
+Write a PARAMETER_SWEEP_RESULTS.md in the market-agent root with:
+	•	Top 10 results per pair — sorted by Sharpe, with all metrics
+	•	Graduation status — how many combinations graduated? Which ones?
+	•	Exit type breakdown — for the top performers
+	•	Arb fee tier finding — stable or volatile? Does it change the math?
+	•	Recommended next step — based on results, what should Opus and Nate focus on?
+
+Constraints
+Security
+	•	No reading .env files.
+	•	No touching API keys.
+	•	If you need a database connection string, it should already be available through the existing config module (src/config.js). Do not look at how it gets the credentials.
+Scope
+	•	Do not modify live pipeline files. agent.js, server.js, ingest modules are off limits.
+	•	Do not modify existing signal modules. The sweep tests existing signal logic; it doesn’t change it.
+	•	Minimal changes to backtest modules. If backtestDirectional() needs parameter overrides, add them cleanly. Don’t restructure.
+	•	New files only: src/backtest/sweep.js and the npm script entry in package.json.
+Cost
+	•	$0 target. The sweep runs against local Postgres data using deterministic signal modules. No Claude API calls. No external API calls. Pure compute.
+Build Sequence
+	•	Read the existing backtest harness — understand how backtestDirectional() accepts parameters
+	•	Modify if needed — add parameter override support (time_limit, take_profit, stop_loss, confidence_threshold)
+	•	Build sweep.js — grid search runner, Postgres persistence, summary output
+	•	Add npm script — "sweep": "node src/backtest/sweep.js"
+	•	Run the full sweep — 640 combinations, both pairs
+	•	Check arb fee tier — quick RPC/subgraph query
+	•	Generate exit analysis — for top performers
+	•	Write PARAMETER_SWEEP_RESULTS.md — full summary report
+
+EXPECTED OUTCOME: Either we find parameter combinations that graduate ETH/USDC directional (most likely) and possibly cbBTC/USDC directional, or we learn exactly how close the best combinations get and what else needs to change. Both outcomes are useful. The worst result is no data — so run the sweep and report what you find.

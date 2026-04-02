@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentinel Market Agent — Briefing Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      background: #0a0e17;
+      color: #c5cdd9;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    .header {
+      border-bottom: 1px solid #1e2a3a;
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+    }
+    .header h1 { color: #e2e8f0; font-size: 18px; font-weight: 600; }
+    .header .meta { color: #64748b; font-size: 12px; margin-top: 4px; }
+    .status-bar {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 24px;
+      padding: 12px 16px;
+      background: #111827;
+      border-radius: 8px;
+      border: 1px solid #1e2a3a;
+      font-size: 13px;
+    }
+    .status-item { display: flex; gap: 8px; }
+    .status-label { color: #64748b; }
+    .status-value { color: #e2e8f0; }
+    .status-value.positive { color: #34d399; }
+    .status-value.negative { color: #f87171; }
+    .status-value.neutral { color: #fbbf24; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+    .card {
+      background: #111827;
+      border: 1px solid #1e2a3a;
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .card h2 {
+      color: #94a3b8;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 12px;
+    }
+    .card.full { grid-column: 1 / -1; }
+    .trade-idea {
+      padding: 12px;
+      margin-bottom: 8px;
+      background: #0d1321;
+      border-radius: 6px;
+      border-left: 3px solid #1e2a3a;
+    }
+    .trade-idea.long { border-left-color: #34d399; }
+    .trade-idea.short { border-left-color: #f87171; }
+    .trade-idea .pair { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+    .trade-idea .direction { font-size: 12px; font-weight: 600; margin-left: 8px; }
+    .trade-idea .direction.long { color: #34d399; }
+    .trade-idea .direction.short { color: #f87171; }
+    .trade-idea .direction.neutral { color: #64748b; }
+    .trade-idea .details { font-size: 12px; color: #64748b; margin-top: 6px; }
+    .confidence-bar {
+      height: 4px;
+      background: #1e2a3a;
+      border-radius: 2px;
+      margin-top: 8px;
+      overflow: hidden;
+    }
+    .confidence-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+    .confidence-fill.long { background: #34d399; }
+    .confidence-fill.short { background: #f87171; }
+    .confidence-fill.neutral { background: #64748b; }
+    .conflict {
+      padding: 8px 12px;
+      margin-bottom: 6px;
+      background: #1c1207;
+      border-radius: 4px;
+      border-left: 3px solid #fbbf24;
+      font-size: 13px;
+    }
+    .source-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      font-size: 13px;
+      border-bottom: 1px solid #1e2a3a;
+    }
+    .source-row:last-child { border-bottom: none; }
+    .source-status { font-size: 12px; }
+    .source-status.ok { color: #34d399; }
+    .source-status.error { color: #f87171; }
+    .source-status.skip { color: #64748b; }
+    .theme-tag {
+      display: inline-block;
+      padding: 2px 8px;
+      margin: 2px;
+      background: #1e2a3a;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .refresh-btn {
+      background: #1e2a3a;
+      color: #94a3b8;
+      border: 1px solid #2d3a4d;
+      padding: 6px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .refresh-btn:hover { background: #2d3a4d; color: #e2e8f0; }
+    .empty { color: #475569; font-style: italic; font-size: 13px; }
+    pre { font-size: 12px; white-space: pre-wrap; color: #94a3b8; }
+    .history-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      margin-bottom: 4px;
+      background: #0d1321;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .history-row:hover { background: #1e2a3a; }
+    .history-meta { color: #64748b; font-size: 12px; }
+    .history-regime { font-size: 12px; padding: 2px 6px; border-radius: 3px; background: #1e2a3a; }
+    /* Paper trading styles */
+    .proposal {
+      padding: 12px;
+      margin-bottom: 8px;
+      background: #0d1321;
+      border-radius: 6px;
+      border-left: 3px solid #1e2a3a;
+    }
+    .proposal.long { border-left-color: #34d399; }
+    .proposal.short { border-left-color: #f87171; }
+    .proposal .prop-header { display: flex; justify-content: space-between; align-items: center; }
+    .proposal .pair { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+    .proposal .details { font-size: 12px; color: #64748b; margin-top: 6px; }
+    .proposal .actions { display: flex; gap: 8px; margin-top: 8px; }
+    .btn-approve {
+      background: #065f46; color: #34d399; border: 1px solid #34d399;
+      padding: 4px 14px; border-radius: 4px; cursor: pointer;
+      font-family: inherit; font-size: 12px;
+    }
+    .btn-approve:hover { background: #34d399; color: #0a0e17; }
+    .btn-reject {
+      background: #7f1d1d; color: #f87171; border: 1px solid #f87171;
+      padding: 4px 14px; border-radius: 4px; cursor: pointer;
+      font-family: inherit; font-size: 12px;
+    }
+    .btn-reject:hover { background: #f87171; color: #0a0e17; }
+    .verdict-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 11px; font-weight: 600;
+    }
+    .verdict-badge.SAFE { background: #065f46; color: #34d399; }
+    .verdict-badge.LOW_RISK { background: #065f46; color: #34d399; }
+    .verdict-badge.CAUTION { background: #78350f; color: #fbbf24; }
+    .verdict-badge.DANGER { background: #7f1d1d; color: #f87171; }
+    .verdict-badge.HIGH_RISK { background: #7f1d1d; color: #f87171; }
+    .position-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 12px; margin-bottom: 4px; background: #0d1321;
+      border-radius: 4px; font-size: 13px;
+    }
+    .pnl-positive { color: #34d399; }
+    .pnl-negative { color: #f87171; }
+    .metric-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .metric-box { text-align: center; }
+    .metric-box .value { font-size: 20px; font-weight: 600; color: #e2e8f0; }
+    .metric-box .label { font-size: 11px; color: #64748b; text-transform: uppercase; }
+    .countdown { color: #fbbf24; font-size: 11px; }
+    .sentinel-row {
+      padding: 6px 12px; margin-bottom: 4px; background: #0d1321;
+      border-radius: 4px; font-size: 12px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Sentinel Market Agent</h1>
+    <div class="meta">
+      <span id="cycle">Cycle: —</span> &nbsp;|&nbsp;
+      <span id="timestamp">Last update: —</span> &nbsp;|&nbsp;
+      <span id="uptime">Uptime: —</span> &nbsp;
+      <button class="refresh-btn" onclick="triggerCycle()">Run Cycle</button>
+      <button class="refresh-btn" onclick="loadStatus()">Refresh</button>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <span class="status-label">Regime:</span>
+      <span class="status-value" id="regime">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Sentiment:</span>
+      <span class="status-value" id="sentiment">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Signals:</span>
+      <span class="status-value" id="signalCount">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Sources:</span>
+      <span class="status-value" id="sourceCount">—</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Trade Ideas</h2>
+      <div id="tradeIdeas"><p class="empty">Waiting for first cycle...</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Signal Conflicts</h2>
+      <div id="conflicts"><p class="empty">No conflicts detected</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Data Sources</h2>
+      <div id="sources"><p class="empty">Loading...</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Key Themes</h2>
+      <div id="themes"><p class="empty">No themes available</p></div>
+    </div>
+
+    <div class="card full">
+      <h2>Latest Briefing</h2>
+      <pre id="briefingText">Waiting for first cycle...</pre>
+    </div>
+
+    <div class="card full">
+      <h2>Briefing History</h2>
+      <div id="briefingHistory"><p class="empty">Loading...</p></div>
+    </div>
+  </div>
+
+  <!-- Paper Trading Section -->
+  <div class="header" style="margin-top: 32px;">
+    <h1>Paper Trading</h1>
+    <div class="meta">
+      <button class="refresh-btn" onclick="loadPaperData()">Refresh Paper</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card full">
+      <h2>Trade Proposals (Pending Approval)</h2>
+      <div id="proposals"><p class="empty">No pending proposals</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Open Positions</h2>
+      <div id="openPositions"><p class="empty">No open positions</p></div>
+    </div>
+
+    <div class="card">
+      <h2>Paper Trading Metrics</h2>
+      <div id="paperMetrics"><p class="empty">No trades yet</p></div>
+    </div>
+
+    <div class="card full">
+      <h2>Trade History</h2>
+      <div id="paperHistory"><p class="empty">No closed trades</p></div>
+    </div>
+
+    <div class="card full">
+      <h2>Sentinel Verification Log</h2>
+      <div id="sentinelLog"><p class="empty">No recent verifications</p></div>
+    </div>
+  </div>
+
+  <script>
+    async function loadStatus() {
+      try {
+        const res = await fetch('/dashboard/data/status');
+        const data = await res.json();
+
+        document.getElementById('cycle').textContent = `Cycle: ${data.cycleCount}`;
+        document.getElementById('uptime').textContent = `Uptime: ${Math.floor(data.uptime)}s`;
+
+        if (data.lastCycle) {
+          document.getElementById('timestamp').textContent = `Last update: ${data.lastCycle.timestamp}`;
+          document.getElementById('sourceCount').textContent =
+            `${Object.values(data.lastCycle.bySource || {}).filter(s => s.count > 0).length}/${Object.keys(data.lastCycle.bySource || {}).length} active`;
+
+          // Sources
+          const srcHtml = Object.entries(data.lastCycle.bySource || {}).map(([name, info]) => {
+            const cls = info.status === 'ok' ? (info.count > 0 ? 'ok' : 'skip') : 'error';
+            const detail = info.status === 'ok' ? `${info.count} pts (${info.latency_ms}ms)` : info.error || 'error';
+            return `<div class="source-row"><span>${name}</span><span class="source-status ${cls}">${detail}</span></div>`;
+          }).join('');
+          document.getElementById('sources').innerHTML = srcHtml || '<p class="empty">No data</p>';
+        }
+
+        if (data.lastSignals) {
+          document.getElementById('signalCount').textContent = data.lastSignals.total_signals || 0;
+        }
+
+        // Load briefing
+        const briefRes = await fetch('/dashboard/data/briefing');
+        const briefing = await briefRes.json();
+
+        if (briefing.formatted) {
+          document.getElementById('briefingText').textContent = briefing.formatted;
+        }
+
+        if (briefing.regime) {
+          const r = briefing.regime;
+          const regimeEl = document.getElementById('regime');
+          regimeEl.textContent = `${r.current} (${(r.confidence * 100).toFixed(0)}%)`;
+          regimeEl.className = 'status-value ' + (r.current.includes('up') || r.current === 'risk_on' ? 'positive' : r.current.includes('down') || r.current === 'risk_off' ? 'negative' : 'neutral');
+        }
+
+        const sent = briefing.overall_sentiment || 0;
+        const sentEl = document.getElementById('sentiment');
+        sentEl.textContent = `${sent > 0 ? '+' : ''}${(sent * 100).toFixed(0)}%`;
+        sentEl.className = 'status-value ' + (sent > 0.1 ? 'positive' : sent < -0.1 ? 'negative' : 'neutral');
+
+        // Trade ideas
+        const ideas = briefing.trade_ideas || [];
+        if (ideas.length > 0) {
+          document.getElementById('tradeIdeas').innerHTML = ideas.map(i => `
+            <div class="trade-idea ${i.direction}">
+              <span class="pair">${i.pair}</span>
+              <span class="direction ${i.direction}">${i.direction.toUpperCase()}</span>
+              <div class="details">
+                Confidence: ${(i.confidence * 100).toFixed(1)}%
+                ${i.qualitative_adjustment ? ` (qual: ${i.qualitative_adjustment > 0 ? '+' : ''}${(i.qualitative_adjustment * 100).toFixed(0)}%)` : ''}
+                &nbsp;|&nbsp; Regime: ${i.regime} &nbsp;|&nbsp; Signals: ${i.signal_count}
+              </div>
+              <div class="confidence-bar"><div class="confidence-fill ${i.direction}" style="width: ${i.confidence * 100}%"></div></div>
+            </div>
+          `).join('');
+        }
+
+        // Conflicts
+        const conflicts = briefing.signal_conflicts || [];
+        if (conflicts.length > 0) {
+          document.getElementById('conflicts').innerHTML = conflicts.map(c =>
+            `<div class="conflict">⚠ ${c.pair}: Quant ${c.quant_direction} → Adjusted ${c.adjusted_direction} (${(c.adjustment * 100).toFixed(0)}%)<br>${c.rationale}</div>`
+          ).join('');
+        }
+
+        // Themes
+        const themes = briefing.key_themes || [];
+        if (themes.length > 0) {
+          document.getElementById('themes').innerHTML = themes.map(t => `<span class="theme-tag">${t}</span>`).join('');
+        }
+
+        // Briefing history (M2)
+        try {
+          const histRes = await fetch('/dashboard/data/briefings?limit=10');
+          const history = await histRes.json();
+          if (Array.isArray(history) && history.length > 0) {
+            document.getElementById('briefingHistory').innerHTML = history.map(b => {
+              const json = b.briefing_json || b;
+              const ts = b.created_at || json.timestamp || '—';
+              const regime = json.regime?.current || b.regime || '—';
+              const ideas = json.trade_ideas?.length || 0;
+              const delta = json.regime?.delta ? ` (${json.regime.delta})` : '';
+              return `<div class="history-row">
+                <span>${new Date(ts).toLocaleString()}</span>
+                <span class="history-meta">Cycle ${json.cycle || b.cycle || '?'} &nbsp;|&nbsp; ${ideas} ideas</span>
+                <span class="history-regime">${regime}${delta}</span>
+              </div>`;
+            }).join('');
+          } else {
+            document.getElementById('briefingHistory').innerHTML = '<p class="empty">No historical briefings yet</p>';
+          }
+        } catch (he) {
+          document.getElementById('briefingHistory').innerHTML = '<p class="empty">Could not load history</p>';
+        }
+
+      } catch (e) {
+        console.error('Failed to load status:', e);
+      }
+    }
+
+    async function triggerCycle() {
+      try {
+        document.querySelector('.refresh-btn').textContent = 'Running...';
+        await fetch('/ingest', { method: 'POST' });
+        await loadStatus();
+        document.querySelector('.refresh-btn').textContent = 'Run Cycle';
+      } catch (e) {
+        console.error('Cycle failed:', e);
+        document.querySelector('.refresh-btn').textContent = 'Run Cycle';
+      }
+    }
+
+    // ── Paper Trading Functions ──
+
+    async function loadPaperData() {
+      await Promise.all([loadProposals(), loadPositions(), loadPaperMetrics(), loadPaperHistory()]);
+    }
+
+    async function loadProposals() {
+      try {
+        const res = await fetch('/api/paper/proposals');
+        const proposals = await res.json();
+        const el = document.getElementById('proposals');
+
+        if (!Array.isArray(proposals) || proposals.length === 0) {
+          el.innerHTML = '<p class="empty">No pending proposals</p>';
+          return;
+        }
+
+        el.innerHTML = proposals.map(p => {
+          const expiresAt = new Date(p.expires_at);
+          const remaining = Math.max(0, Math.floor((expiresAt - Date.now()) / 60000));
+          return `
+            <div class="proposal ${p.direction}">
+              <div class="prop-header">
+                <div>
+                  <span class="pair">${p.pair}</span>
+                  <span class="direction ${p.direction}">${p.direction.toUpperCase()}</span>
+                  <span class="verdict-badge ${p.sentinel_verdict || ''}">${p.sentinel_verdict || '—'}</span>
+                </div>
+                <span class="countdown">${remaining}m remaining</span>
+              </div>
+              <div class="details">
+                Confidence: ${(parseFloat(p.confidence) * 100).toFixed(1)}% &nbsp;|&nbsp;
+                Price: $${parseFloat(p.current_price).toLocaleString()} &nbsp;|&nbsp;
+                ${formatAttribution(p.signal_attribution)}
+              </div>
+              <div class="actions">
+                <button class="btn-approve" onclick="approve('${p.proposal_id}')">Approve</button>
+                <button class="btn-reject" onclick="reject('${p.proposal_id}')">Reject</button>
+              </div>
+            </div>`;
+        }).join('');
+      } catch (e) {
+        document.getElementById('proposals').innerHTML = '<p class="empty">Could not load proposals</p>';
+      }
+    }
+
+    function formatAttribution(attr) {
+      if (!attr || typeof attr !== 'object') return '';
+      const parsed = typeof attr === 'string' ? JSON.parse(attr) : attr;
+      return Object.entries(parsed).map(([k, v]) =>
+        `${k}: ${v.direction}(${(v.confidence * 100).toFixed(0)}%)`
+      ).join(', ');
+    }
+
+    async function approve(proposalId) {
+      try {
+        await fetch(`/api/paper/proposals/${proposalId}/approve`, { method: 'POST' });
+        await loadPaperData();
+      } catch (e) { console.error('Approve failed:', e); }
+    }
+
+    async function reject(proposalId) {
+      try {
+        await fetch(`/api/paper/proposals/${proposalId}/reject`, { method: 'POST' });
+        await loadPaperData();
+      } catch (e) { console.error('Reject failed:', e); }
+    }
+
+    async function loadPositions() {
+      try {
+        const res = await fetch('/api/paper/positions');
+        const positions = await res.json();
+        const el = document.getElementById('openPositions');
+
+        if (!Array.isArray(positions) || positions.length === 0) {
+          el.innerHTML = '<p class="empty">No open positions</p>';
+          return;
+        }
+
+        el.innerHTML = positions.map(p => {
+          const entry = parseFloat(p.entry_price);
+          const entryTime = new Date(p.entry_time);
+          const elapsed = Math.floor((Date.now() - entryTime.getTime()) / 3600000);
+          const remaining = Math.max(0, 48 - elapsed);
+          const tpPrice = p.direction === 'long' ? entry * 1.03 : entry * 0.97;
+          const slPrice = p.direction === 'long' ? entry * 0.95 : entry * 1.05;
+          return `
+            <div class="position-row">
+              <div>
+                <span style="color:#e2e8f0;font-weight:600">${p.pair}</span>
+                <span class="direction ${p.direction}" style="font-size:12px;margin-left:8px">${p.direction.toUpperCase()}</span>
+              </div>
+              <div style="font-size:12px;color:#64748b">
+                Entry: $${entry.toLocaleString()} &nbsp;|&nbsp;
+                TP: $${tpPrice.toFixed(2)} &nbsp;|&nbsp;
+                SL: $${slPrice.toFixed(2)} &nbsp;|&nbsp;
+                ${remaining}h left
+              </div>
+            </div>`;
+        }).join('');
+      } catch (e) {
+        document.getElementById('openPositions').innerHTML = '<p class="empty">Could not load positions</p>';
+      }
+    }
+
+    async function loadPaperMetrics() {
+      try {
+        const res = await fetch('/api/paper/metrics');
+        const m = await res.json();
+        const el = document.getElementById('paperMetrics');
+
+        if (m.totalTrades === 0) {
+          el.innerHTML = '<p class="empty">No closed trades yet</p>';
+          return;
+        }
+
+        const pnlClass = m.totalPnlBps >= 0 ? 'pnl-positive' : 'pnl-negative';
+        el.innerHTML = `
+          <div class="metric-grid">
+            <div class="metric-box">
+              <div class="value">${m.totalTrades}</div>
+              <div class="label">Trades</div>
+            </div>
+            <div class="metric-box">
+              <div class="value">${(m.winRate * 100).toFixed(1)}%</div>
+              <div class="label">Win Rate</div>
+            </div>
+            <div class="metric-box">
+              <div class="value ${pnlClass}">${m.avgPnlBps > 0 ? '+' : ''}${m.avgPnlBps.toFixed(1)}</div>
+              <div class="label">Avg PnL (bps)</div>
+            </div>
+            <div class="metric-box">
+              <div class="value ${pnlClass}">${m.totalPnlBps > 0 ? '+' : ''}${m.totalPnlBps.toFixed(1)}</div>
+              <div class="label">Total PnL (bps)</div>
+            </div>
+            <div class="metric-box">
+              <div class="value">${m.sharpeRatio.toFixed(2)}</div>
+              <div class="label">Sharpe</div>
+            </div>
+            <div class="metric-box">
+              <div class="value" style="font-size:14px;color:#64748b">Target: 72.6</div>
+              <div class="label">Backtest Avg (bps)</div>
+            </div>
+          </div>`;
+      } catch (e) {
+        document.getElementById('paperMetrics').innerHTML = '<p class="empty">Could not load metrics</p>';
+      }
+    }
+
+    async function loadPaperHistory() {
+      try {
+        const res = await fetch('/api/paper/history?limit=20');
+        const trades = await res.json();
+        const el = document.getElementById('paperHistory');
+
+        if (!Array.isArray(trades) || trades.length === 0) {
+          el.innerHTML = '<p class="empty">No closed trades yet</p>';
+          return;
+        }
+
+        el.innerHTML = trades.map(t => {
+          const pnl = parseFloat(t.pnl_bps);
+          const pnlClass = pnl >= 0 ? 'pnl-positive' : 'pnl-negative';
+          const status = t.status.replace('closed_', '').toUpperCase();
+          return `
+            <div class="position-row">
+              <div>
+                <span style="color:#e2e8f0">${t.pair}</span>
+                <span class="direction ${t.direction}" style="font-size:12px;margin-left:8px">${t.direction.toUpperCase()}</span>
+              </div>
+              <div style="font-size:12px">
+                <span class="${pnlClass}">${pnl > 0 ? '+' : ''}${pnl.toFixed(1)} bps</span>
+                &nbsp;|&nbsp; ${status}
+                &nbsp;|&nbsp; ${new Date(t.exit_time).toLocaleString()}
+              </div>
+            </div>`;
+        }).join('');
+      } catch (e) {
+        document.getElementById('paperHistory').innerHTML = '<p class="empty">Could not load history</p>';
+      }
+    }
+
+    // Load on page open, then refresh every 60s
+    loadStatus();
+    loadPaperData();
+    setInterval(loadStatus, 60000);
+    setInterval(loadPaperData, 30000);
+  </script>
+</body>
+</html>

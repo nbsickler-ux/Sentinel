@@ -23,87 +23,12 @@ import { Redis } from "@upstash/redis";
 import { Ratelimit } from "@upstash/ratelimit";
 import dotenv from "dotenv";
 import axios from "axios";
-import pino from "pino";
-import pinoHttp from "pino-http";
-import {
-  filterResponse,
-  gradeFromScore,
-  scoreToken,
-  generatePositionRecommendations,
-  checkSanctionsWithSet,
-  checkExploitAssociationWithRegistry,
-  DETAIL_LEVELS,
-  VERSION,
-} from "./lib/scoring.js";
-import {
-  scoreProtocolDimensions,
-  scoreCounterpartyDimensions,
-  scorePositionDimensions,
-  computePreflightComposite,
-  CATEGORY_RISK_MAP,
-} from "./lib/scoring-engine/index.js";
-import { initPool, runMigrations } from "./lib/db.js";
-import { createRequestLogger } from "./lib/request-logger.js";
-import { createAdminRouter } from "./lib/admin-stats.js";
-import { initEAS, isEASEnabled, createVerificationAttestation, getAttestationsByTarget } from "./lib/eas/client.js";
-import { initReputationStore, getAgentProfile, updateAgentProfile } from "./lib/reputation/store.js";
-import { getTierCacheTTLs, shouldSkipOfacRecheck } from "./lib/reputation/tiers.js";
-import { initWatchlist, addWatch, removeWatch, getWatchesForAgent } from "./lib/monitoring/watchlist.js";
-import { initScanner, startScanner, stopScanner } from "./lib/monitoring/scanner.js";
-import { initAuditLog, writeAuditLog } from "./lib/compliance/audit-log.js";
-import { getAuditHistory, getAuditSummary, generateDailyReport } from "./lib/compliance/audit-log.js";
 
 dotenv.config();
-
-// ============================================================
-// STRUCTURED LOGGING WITH PINO
-// ============================================================
-const LOG_LEVEL = process.env.LOG_LEVEL || "info";
-const NODE_ENV = process.env.NODE_ENV || "development";
-
-// Configure pino with optional pretty-printing in development
-const pinoConfig = {
-  level: LOG_LEVEL,
-  timestamp: pino.stdTimeFunctions.isoTime,
-};
-
-// Create logger with optional pretty-printing in development
-let logger;
-try {
-  if (NODE_ENV !== "production") {
-    // Development: use pino-pretty for human-readable logs
-    logger = pino(
-      pinoConfig,
-      pino.transport({
-        target: "pino-pretty",
-        options: {
-          colorize: true,
-          translateTime: "SYS:standard",
-          ignore: "pid,hostname",
-        },
-      })
-    );
-  } else {
-    // Production: use standard JSON format
-    logger = pino(pinoConfig);
-  }
-} catch (e) {
-  // Fallback logger for testing environment
-  logger = { info: () => {}, error: () => {}, warn: () => {}, debug: () => {} };
-}
 
 const app = express();
 app.set("trust proxy", true);   // Render (and most PaaS) sit behind a reverse proxy — trust X-Forwarded-Proto so req.protocol is "https"
 app.use(express.json());
-
-// Add pino-http middleware for automatic request logging (only if logger has request method)
-if (typeof logger.request === 'function') {
-  try {
-    app.use(pinoHttp({ logger }));
-  } catch (e) {
-    // Skip middleware if it fails
-  }
-}
 
 // Favicon — x402scan requires one to avoid OG-image constraint issues during registration
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
@@ -120,7 +45,7 @@ app.get("/favicon.svg", (_req, res) => {
 // ============================================================
 // CONFIGURATION
 // ============================================================
-// VERSION imported from lib/scoring.js
+const VERSION = "0.4.0";
 const PORT = process.env.PORT || 4021;
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 const NETWORK = process.env.NETWORK || "base-sepolia";
@@ -147,7 +72,43 @@ const PRICE = {
   preflight:          "$0.025",
 };
 
-// filterResponse, gradeFromScore, DETAIL_LEVELS imported from lib/scoring.js
+// Response detail levels:
+//   "full"    — all dimensions, scores, evidence (default for now, useful for debugging)
+//   "standard"— verdict, grade, risk flags, evidence (no dimension scores)
+//   "minimal" — verdict and grade only (maximum IP protection)
+const DETAIL_LEVELS = ["full", "standard", "minimal"];
+
+function filterResponse(result, detailLevel) {
+  if (detailLevel === "full") return result;
+
+  if (detailLevel === "minimal") {
+    return {
+      address: result.address || result.protocol_address,
+      chain: result.chain,
+      verdict: result.verdict,
+      trust_grade: result.trust_grade,
+      confidence: result.confidence,
+      token_name: result.token_name || undefined,
+      token_symbol: result.token_symbol || undefined,
+      meta: result.meta,
+    };
+  }
+
+  // "standard" — remove dimension scores but keep evidence and flags
+  const filtered = { ...result };
+  delete filtered.dimensions;
+  delete filtered.trust_score;
+  return filtered;
+}
+
+// Trust grade thresholds
+function gradeFromScore(score) {
+  if (score >= 85) return { grade: "A", verdict: "SAFE" };
+  if (score >= 70) return { grade: "B", verdict: "LOW_RISK" };
+  if (score >= 55) return { grade: "C", verdict: "CAUTION" };
+  if (score >= 40) return { grade: "D", verdict: "HIGH_RISK" };
+  return { grade: "F", verdict: "DANGER" };
+}
 
 
 // ============================================================
@@ -175,20 +136,18 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
     prefix: "sentinel:ratelimit",
   });
 
-  logger.info({ service: "sentinel", feature: "redis" }, "Redis caching enabled (Upstash)");
-  logger.info({ service: "sentinel", feature: "ratelimit" }, "Rate limiting enabled: 25 calls/wallet/day");
+  console.log("  Redis caching enabled (Upstash)");
+  console.log("  Rate limiting enabled: 25 calls/wallet/day");
 } else {
-  logger.info({ service: "sentinel", feature: "redis" }, "Redis caching disabled (no UPSTASH_REDIS_REST_URL configured)");
+  console.log("  Redis caching disabled (no UPSTASH_REDIS_REST_URL configured)");
 }
 
 // Cache TTLs in seconds
 const CACHE_TTL = {
-  protocol:         600,   // 10 min — contract metadata changes slowly
-  token:            300,   // 5 min — token security can shift faster
-  position:         300,   // 5 min
-  counterparty:     900,   // 15 min — sanctions lists update daily
-  contractMetadata: 86400, // 24 hours — deployment data never changes
-  preflight:        300,   // 5 min — composite results for identical inputs
+  protocol:     600,   // 10 min — contract metadata changes slowly
+  token:        300,   // 5 min — token security can shift faster
+  position:     300,   // 5 min
+  counterparty: 900,   // 15 min — sanctions lists update daily
 };
 
 /**
@@ -232,11 +191,10 @@ async function cachedCall(cacheKey, ttlSeconds, computeFn) {
 // Maps contract addresses to protocol metadata for TVL + hack lookups
 let protocolRegistry = {};   // address -> { slug, name, ... }
 let registryLoaded = false;
-let registryLastRefreshed = null;
 
 async function loadProtocolRegistry() {
   try {
-    logger.info({ source: "defilama" }, "Loading DeFiLlama protocol registry...");
+    console.log("  Loading DeFiLlama protocol registry...");
     const response = await axios.get("https://api.llama.fi/protocols", { timeout: 15000 });
     const protocols = response.data;
 
@@ -280,68 +238,9 @@ async function loadProtocolRegistry() {
     }
 
     registryLoaded = true;
-    registryLastRefreshed = new Date().toISOString();
-    logger.info({ addressCount: Object.keys(protocolRegistry).length, protocolCount: protocols.length }, "Protocol registry loaded");
+    console.log(`  Protocol registry loaded: ${Object.keys(protocolRegistry).length} addresses indexed from ${protocols.length} protocols`);
   } catch (e) {
-    logger.error({ err: e, source: "defilama" }, "Failed to load protocol registry");
-  }
-}
-
-/**
- * Refresh protocol registry in the background (24h schedule).
- * Mirrors loadProtocolRegistry logic exactly. Swaps atomically.
- */
-async function refreshProtocolRegistry() {
-  try {
-    logger.info({ source: "defilama" }, "Refreshing protocol registry (scheduled)...");
-    const response = await axios.get("https://api.llama.fi/protocols", { timeout: 15000 });
-    const protocols = response.data;
-    const newRegistry = {};
-
-    for (const p of protocols) {
-      const addresses = [];
-      if (p.address) addresses.push(p.address.toLowerCase());
-      if (p.chainAddresses) {
-        for (const [chain, addr] of Object.entries(p.chainAddresses)) {
-          if (typeof addr === "string") addresses.push(addr.toLowerCase());
-        }
-      }
-
-      for (const addr of addresses) {
-        const cleanAddr = addr.includes(":") ? addr.split(":")[1] : addr;
-        if (cleanAddr && cleanAddr.startsWith("0x")) {
-          newRegistry[cleanAddr] = {
-            slug: p.slug,
-            name: p.name,
-            category: p.category,
-            audits: p.audits,
-            audit_links: p.audit_links || [],
-            hacked: p.hacked || false,
-            hackDate: p.hackDate || null,
-            hackAmount: p.hackAmount || null,
-            governanceID: p.governanceID || null,
-            treasury: p.treasury || null,
-            openSource: p.openSource !== false,
-            forkedFrom: p.forkedFrom || [],
-            twitter: p.twitter || null,
-            url: p.url || null,
-            listedAt: p.listedAt || null,
-            mcap: p.mcap || null,
-            chainTvls: p.chainTvls || {},
-          };
-        }
-      }
-    }
-
-    // Atomic swap — no request sees a half-built registry
-    const oldSize = Object.keys(protocolRegistry).length;
-    protocolRegistry = newRegistry;
-    registryLoaded = true;
-    registryLastRefreshed = new Date().toISOString();
-    const newSize = Object.keys(protocolRegistry).length;
-    logger.info({ oldSize, newSize, delta: newSize - oldSize }, "Protocol registry refreshed successfully");
-  } catch (error) {
-    logger.error({ err: error }, "Protocol registry refresh failed — keeping existing data");
+    console.error("  Failed to load protocol registry:", e.message);
   }
 }
 
@@ -377,7 +276,7 @@ async function getGoPlusToken() {
       return goplusAccessToken;
     }
   } catch (e) {
-    logger.error({ err: e, service: "goplus" }, "GoPlus auth failed");
+    console.error("  GoPlus auth failed:", e.message);
   }
   return null;
 }
@@ -407,24 +306,6 @@ const KNOWN_AUDITED = {
     audited: true,
     auditors: ["Trail of Bits"],
     lastAudit: "2024-12-01",
-  },
-  // Aerodrome Finance — largest DEX on Base ($1.5B+ TVL)
-  // Velodrome fork; audited by Ether Authority (June 2024)
-  // Smart contracts never exploited (DNS/frontend incident Nov 2023 did not affect contracts)
-  "0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43": {  // Router
-    audited: true,
-    auditors: ["Ether Authority"],
-    lastAudit: "2024-06-05",
-  },
-  "0x420dd381b31aef6683db6b902084cb0ffece40da": {  // Pool Factory
-    audited: true,
-    auditors: ["Ether Authority"],
-    lastAudit: "2024-06-05",
-  },
-  "0x940181a94a35a4569e4529a3cdfb74e38fd98631": {  // AERO Token
-    audited: true,
-    auditors: ["Ether Authority"],
-    lastAudit: "2024-06-05",
   },
 };
 
@@ -598,26 +479,19 @@ async function getContractMetadata(contractAddress, chain) {
     }
   }
 
-  // If we got no real data, return nulls with degraded flag
-  // SECURITY: Never return fake positive data — callers must handle nulls
-  // and scoring engine should apply confidence penalty for missing metadata
-  // NOTE: `mock` field retained for backward compatibility with scoring-engine/index.js
-  // which checks contract.mock for confidence penalties (lines 143, 217)
+  // If we got no real data, fall back to mock
   if (result.isContract === null && result.verifiedSource === null && result.ageDays === null) {
-    logger.warn({ contractAddress, chain }, "Contract metadata unavailable — all data sources failed. Returning degraded result.");
     return {
-      isContract: null,
-      verifiedSource: null,
-      proxyPattern: null,
-      ownerIsMultisig: null,
-      ageDays: null,
+      isContract: true,
+      verifiedSource: true,
+      proxyPattern: "UUPS",
+      ownerIsMultisig: true,
+      ageDays: 412,
       mock: true,
-      degraded: true,
-      meta: {},
     };
   }
 
-  return { ...result, meta: {} };
+  return result;
 }
 
 /**
@@ -773,7 +647,87 @@ async function getTokenMarketData(tokenAddress) {
   }
 }
 
-// scoreToken imported from lib/scoring.js
+/**
+ * Score a token across safety dimensions
+ */
+function scoreToken(security, market) {
+  const startTime = Date.now();
+  const dimensions = {};
+  const riskFlags = [];
+
+  // Determine confidence based on data availability
+  const confidence = security.available ? 0.90 : 0.50;
+
+  if (!security.available) {
+    return {
+      verdict: "UNKNOWN",
+      trust_grade: "N/A",
+      trust_score: null,
+      confidence,
+      dimensions: {},
+      risk_flags: ["No security data available for this token"],
+      meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION },
+    };
+  }
+
+  // 1. Honeypot & Scam Detection (30%)
+  let honeypotScore = 95;
+  if (security.is_honeypot) { honeypotScore = 0; riskFlags.push("HONEYPOT DETECTED - do not interact"); }
+  if (security.honeypot_with_same_creator) { honeypotScore = Math.min(honeypotScore, 10); riskFlags.push("Creator has deployed honeypots before"); }
+  if (security.is_airdrop_scam) { honeypotScore = Math.min(honeypotScore, 5); riskFlags.push("Identified as airdrop scam"); }
+  if (security.cannot_sell_all) { honeypotScore = Math.min(honeypotScore, 15); riskFlags.push("Cannot sell all tokens - partial honeypot"); }
+  if (security.cannot_buy) { honeypotScore = Math.min(honeypotScore, 20); riskFlags.push("Buying is restricted"); }
+  dimensions.honeypot_safety = { score: honeypotScore, detail: security.is_honeypot ? "Honeypot detected" : "No honeypot indicators" };
+
+  // 2. Tax Analysis (20%)
+  let taxScore = 90;
+  const buyTax = security.buy_tax || 0;
+  const sellTax = security.sell_tax || 0;
+  if (buyTax > 0.10 || sellTax > 0.10) { taxScore -= 30; riskFlags.push(`High tax: buy ${(buyTax * 100).toFixed(1)}% / sell ${(sellTax * 100).toFixed(1)}%`); }
+  else if (buyTax > 0.05 || sellTax > 0.05) { taxScore -= 15; }
+  if (security.slippage_modifiable) { taxScore -= 20; riskFlags.push("Slippage is modifiable by owner"); }
+  if (security.personal_slippage_modifiable) { taxScore -= 15; riskFlags.push("Personal slippage can be modified per-address"); }
+  dimensions.tax_fairness = { score: Math.max(0, taxScore), detail: `Buy tax: ${(buyTax * 100).toFixed(1)}%, Sell tax: ${(sellTax * 100).toFixed(1)}%` };
+
+  // 3. Ownership & Control (25%)
+  let ownerScore = 75;
+  if (security.hidden_owner) { ownerScore -= 30; riskFlags.push("Hidden owner detected"); }
+  if (security.can_take_back_ownership) { ownerScore -= 20; riskFlags.push("Ownership can be reclaimed"); }
+  if (security.owner_change_balance) { ownerScore -= 25; riskFlags.push("Owner can modify balances"); }
+  if (security.is_mintable) { ownerScore -= 10; riskFlags.push("Token is mintable - supply can increase"); }
+  if (security.transfer_pausable) { ownerScore -= 10; riskFlags.push("Transfers can be paused"); }
+  if (!security.is_open_source) { ownerScore -= 15; riskFlags.push("Contract source is not verified"); }
+  if (security.is_proxy) { ownerScore -= 5; riskFlags.push("Proxy contract - logic can be upgraded"); }
+  if (security.owner_percent && security.owner_percent > 10) { ownerScore -= 15; riskFlags.push(`Owner holds ${security.owner_percent.toFixed(1)}% of supply`); }
+  dimensions.ownership_risk = { score: Math.max(0, ownerScore), detail: `Open source: ${security.is_open_source}. Mintable: ${security.is_mintable}. Owner balance: ${security.owner_percent ? security.owner_percent.toFixed(1) + "%" : "unknown"}` };
+
+  // 4. Liquidity & Holder Distribution (15%)
+  let liquidityScore = 60;
+  if (security.holder_count && security.holder_count > 10000) liquidityScore += 25;
+  else if (security.holder_count && security.holder_count > 1000) liquidityScore += 15;
+  else if (security.holder_count && security.holder_count > 100) liquidityScore += 5;
+  else if (security.holder_count && security.holder_count < 50) { liquidityScore -= 20; riskFlags.push(`Only ${security.holder_count} holders`); }
+  if (security.creator_percent && security.creator_percent > 20) { liquidityScore -= 15; riskFlags.push(`Creator holds ${security.creator_percent.toFixed(1)}% of supply`); }
+  if (security.is_anti_whale) liquidityScore += 5;
+  if (market.available && market.tvl && market.tvl > 10_000_000) liquidityScore += 10;
+  dimensions.liquidity_distribution = { score: Math.min(100, Math.max(0, liquidityScore)), detail: `Holders: ${security.holder_count || "unknown"}. LP holders: ${security.lp_holder_count || "unknown"}` };
+
+  // 5. Trading Restrictions (10%)
+  let tradingScore = 85;
+  if (security.trading_cooldown) { tradingScore -= 15; riskFlags.push("Trading cooldown enforced"); }
+  if (security.is_blacklisted) { tradingScore -= 20; riskFlags.push("Blacklist function exists"); }
+  if (security.is_whitelisted) { tradingScore -= 10; riskFlags.push("Whitelist function exists - restricted trading"); }
+  dimensions.trading_freedom = { score: Math.max(0, tradingScore), detail: `Cooldown: ${security.trading_cooldown}. Blacklist: ${security.is_blacklisted}. Whitelist: ${security.is_whitelisted}` };
+
+  // Weighted composite
+  const weights = { honeypot_safety: 0.30, tax_fairness: 0.20, ownership_risk: 0.25, liquidity_distribution: 0.15, trading_freedom: 0.10 };
+  const compositeScore = Math.round(
+    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
+  );
+  const { grade, verdict } = gradeFromScore(compositeScore);
+
+  return { verdict, trust_grade: grade, trust_score: compositeScore, confidence, dimensions, risk_flags: riskFlags, meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION } };
+}
 
 
 // ============================================================
@@ -785,51 +739,111 @@ async function getTokenMarketData(tokenAddress) {
  * Analyze a DeFi position for risk factors
  * Uses protocol trust score + position-specific heuristics
  */
-/**
- * Analyze a DeFi position's risk profile.
- * @param {string} protocolAddress - Contract address of the protocol
- * @param {string|null} userAddress - Optional user wallet address
- * @param {string} chain - Chain identifier (default: "base")
- * @param {object|null} precomputedProtocolScore - Optional pre-computed scoreProtocol() result.
- *   Pass this when calling from /preflight to avoid duplicate API calls.
- *   If null, scoreProtocol() is called internally (standalone /verify/position usage).
- */
-async function analyzePosition(protocolAddress, userAddress, chain, precomputedProtocolScore = null) {
+async function analyzePosition(protocolAddress, userAddress, chain) {
   const startTime = Date.now();
 
-  // Reuse pre-computed protocol score if available, otherwise fetch fresh
-  const protocolScore = precomputedProtocolScore || await scoreProtocol(protocolAddress, chain);
+  // Get the underlying protocol trust score
+  const protocolScore = await scoreProtocol(protocolAddress, chain);
 
   // Get protocol info from registry
   const normalized = protocolAddress.toLowerCase();
   const protocol = protocolRegistry[normalized];
+
+  // Position-specific risk dimensions
+  const dimensions = {};
+  const riskFlags = [];
+
+  // 1. Protocol Foundation (40%) - derived from protocol trust score
+  dimensions.protocol_trust = {
+    score: protocolScore.trust_score,
+    detail: `Underlying protocol rated ${protocolScore.trust_grade} (${protocolScore.trust_score}/100): ${protocolScore.verdict}`,
+  };
+  if (protocolScore.trust_score < 55) riskFlags.push(`Underlying protocol rated ${protocolScore.trust_grade} - elevated risk`);
+
+  // 2. Protocol Category Risk (20%)
+  const categoryRisk = {
+    "Dexes": 80,
+    "Lending": 75,
+    "Bridge": 45,
+    "Yield Aggregator": 60,
+    "Yield": 55,
+    "CDP": 70,
+    "Liquid Staking": 75,
+    "Derivatives": 55,
+    "Options": 50,
+    "Algo-Stables": 30,
+    "Insurance": 80,
+    "Launchpad": 40,
+    "Farm": 45,
+    "Ponzi": 5,
+  };
   const category = protocol?.category || "Unknown";
+  const catScore = categoryRisk[category] || 50;
+  dimensions.category_risk = {
+    score: catScore,
+    detail: `Category: ${category}. Inherent risk profile: ${catScore >= 70 ? "lower" : catScore >= 50 ? "moderate" : "higher"}.`,
+  };
+  if (catScore < 40) riskFlags.push(`High-risk category: ${category}`);
+  if (category === "Bridge") riskFlags.push("Bridge protocols carry elevated exploit risk");
+  if (category === "Algo-Stables") riskFlags.push("Algorithmic stablecoins have historically high failure rate");
 
-  // Reuse TVL data from protocol score evidence if available, otherwise fetch fresh
-  // This avoids a duplicate DeFiLlama API call when protocol score already has TVL data
-  const tvl = protocolScore.evidence?.tvl?.current_usd !== undefined
-    ? { currentUsd: protocolScore.evidence.tvl.current_usd, trend30d: protocolScore.evidence.tvl.trend_30d, stable: protocolScore.evidence.tvl.stable }
-    : await getTvlData(protocolAddress);
+  // 3. TVL Health (20%) - larger TVL = more battle-tested
+  const tvl = await getTvlData(protocolAddress);
+  let tvlScore = 50;
+  if (tvl.currentUsd !== null) {
+    if (tvl.currentUsd > 1_000_000_000) tvlScore = 95;
+    else if (tvl.currentUsd > 500_000_000) tvlScore = 85;
+    else if (tvl.currentUsd > 100_000_000) tvlScore = 75;
+    else if (tvl.currentUsd > 10_000_000) tvlScore = 60;
+    else if (tvl.currentUsd > 1_000_000) tvlScore = 45;
+    else tvlScore = 25;
+    if (!tvl.stable) { tvlScore -= 10; riskFlags.push(`TVL volatility: ${tvl.trend30d} in 30 days`); }
+  } else {
+    tvlScore = 30;
+    riskFlags.push("No TVL data available");
+  }
+  dimensions.tvl_health = {
+    score: Math.max(0, tvlScore),
+    detail: tvl.currentUsd ? `TVL: $${(tvl.currentUsd / 1_000_000).toFixed(1)}M. 30d trend: ${tvl.trend30d}` : "TVL data unavailable",
+  };
 
-  // Delegate scoring to private engine
-  const scored = scorePositionDimensions(protocolScore, category, tvl);
+  // 4. Concentration Risk (20%) - is this position a large % of protocol TVL?
+  // Without on-chain position data we provide a structural assessment
+  let concentrationScore = 65;
+  if (tvl.currentUsd && tvl.currentUsd < 5_000_000) {
+    concentrationScore = 40;
+    riskFlags.push("Low-TVL protocol - individual positions may represent significant share");
+  } else if (tvl.currentUsd && tvl.currentUsd > 100_000_000) {
+    concentrationScore = 85;
+  }
+  dimensions.concentration_risk = {
+    score: concentrationScore,
+    detail: "Structural concentration assessment based on protocol TVL depth",
+  };
+
+  // Weighted composite
+  const weights = { protocol_trust: 0.40, category_risk: 0.20, tvl_health: 0.20, concentration_risk: 0.20 };
+  const compositeScore = Math.round(
+    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
+  );
+  const { grade, verdict } = gradeFromScore(compositeScore);
 
   return {
     protocol_address: protocolAddress,
     user_address: userAddress,
     chain,
-    verdict: scored.verdict,
-    trust_grade: scored.grade,
-    trust_score: scored.compositeScore,
+    verdict,
+    trust_grade: grade,
+    trust_score: compositeScore,
     confidence: protocol ? 0.80 : 0.50,
     protocol_info: {
       name: protocol?.name || "Unknown",
-      category,
+      category: protocol?.category || "Unknown",
       underlying_protocol_grade: protocolScore.trust_grade,
     },
-    dimensions: scored.dimensions,
-    risk_flags: scored.riskFlags,
-    recommendations: generatePositionRecommendations(scored.riskFlags, scored.compositeScore),
+    dimensions,
+    risk_flags: riskFlags,
+    recommendations: generatePositionRecommendations(riskFlags, compositeScore),
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
@@ -841,7 +855,17 @@ async function analyzePosition(protocolAddress, userAddress, chain, precomputedP
 /**
  * Generate actionable recommendations based on risk flags
  */
-// Scoring functions delegated to lib/scoring-engine/ (private module)
+function generatePositionRecommendations(riskFlags, score) {
+  const recs = [];
+  if (score < 40) recs.push("Consider exiting this position - risk level is elevated");
+  if (score < 55) recs.push("Set stop-loss or exit triggers if the protocol supports it");
+  if (riskFlags.some(f => f.includes("Bridge"))) recs.push("Minimize time assets spend in bridge contracts");
+  if (riskFlags.some(f => f.includes("TVL volatility"))) recs.push("Monitor TVL trends - rapid outflows may signal issues");
+  if (riskFlags.some(f => f.includes("Algo-Stables"))) recs.push("Limit exposure to algorithmic stablecoin positions");
+  if (riskFlags.some(f => f.includes("Low-TVL"))) recs.push("Consider splitting across multiple protocols to reduce concentration");
+  if (score >= 70) recs.push("Position is in a well-established protocol - standard monitoring recommended");
+  return recs;
+}
 
 
 // ============================================================
@@ -855,7 +879,7 @@ let sanctionsLoaded = false;
 
 async function loadSanctionedAddresses() {
   try {
-    logger.info({ source: "ofac" }, "Loading OFAC sanctioned addresses...");
+    console.log("  Loading OFAC sanctioned addresses...");
     // Primary: 0xB10C's daily-updated list from OFAC SDN
     const response = await axios.get(
       "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt",
@@ -870,9 +894,9 @@ async function loadSanctionedAddresses() {
       sanctionedAddresses.add(addr);
     }
     sanctionsLoaded = true;
-    logger.info({ addressCount: sanctionedAddresses.size, source: "ofac" }, "OFAC sanctions list loaded");
+    console.log(`  OFAC sanctions list loaded: ${sanctionedAddresses.size} ETH addresses indexed`);
   } catch (e) {
-    logger.error({ err: e, source: "ofac" }, "Failed to load OFAC sanctions list");
+    console.error("  Failed to load OFAC sanctions list:", e.message);
     // Try fallback source
     try {
       const fallback = await axios.get(
@@ -887,9 +911,9 @@ async function loadSanctionedAddresses() {
         }
       }
       sanctionsLoaded = true;
-      logger.info({ addressCount: sanctionedAddresses.size, source: "ofac-fallback" }, "OFAC sanctions list loaded (fallback)");
+      console.log(`  OFAC sanctions list loaded (fallback): ${sanctionedAddresses.size} ETH addresses`);
     } catch (e2) {
-      logger.error({ err: e2, source: "ofac-fallback" }, "Fallback sanctions list also failed");
+      console.error("  Fallback sanctions list also failed:", e2.message);
     }
   }
 }
@@ -899,8 +923,6 @@ loadSanctionedAddresses();
 
 /**
  * Check if an address is on the OFAC sanctions list
- * SECURITY: If sanctions list failed to load, returns degraded=true
- * so callers can apply appropriate confidence penalties or hard-block.
  */
 function checkSanctions(address) {
   const normalized = address.toLowerCase();
@@ -910,7 +932,6 @@ function checkSanctions(address) {
     list: isSanctioned ? "OFAC SDN" : null,
     list_loaded: sanctionsLoaded,
     addresses_indexed: sanctionedAddresses.size,
-    degraded: !sanctionsLoaded,
   };
 }
 
@@ -971,46 +992,107 @@ function checkExploitAssociation(address) {
 /**
  * Score a counterparty address across risk dimensions
  */
-async function scoreCounterparty(address, chain, skipOfac = false) {
+async function scoreCounterparty(address, chain) {
   const startTime = Date.now();
-
-  // If agent reputation allows OFAC skip, use a clean placeholder result
-  const sanctionsPromise = skipOfac
-    ? Promise.resolve({ sanctioned: false, list: null, list_loaded: true, degraded: false, skipped: true, reason: "agent_reputation" })
-    : Promise.resolve(checkSanctions(address));
+  const dimensions = {};
+  const riskFlags = [];
 
   // Fetch all data in parallel
   const [sanctions, addressSecurity, exploitAssoc] = await Promise.all([
-    sanctionsPromise,
+    Promise.resolve(checkSanctions(address)),
     getAddressSecurity(address, chain),
     Promise.resolve(checkExploitAssociation(address)),
   ]);
 
-  // Delegate scoring to private engine
-  const scored = scoreCounterpartyDimensions(sanctions, addressSecurity, exploitAssoc);
-
-  // SECURITY: If OFAC list failed to load, cap confidence and add warning
-  let confidence = scored.confidence;
-  const riskFlags = [...scored.riskFlags];
-  if (sanctions.degraded) {
-    confidence = Math.min(confidence, 0.3);
-    riskFlags.push("OFAC_SCREENING_UNAVAILABLE");
-    logger.warn({ address, source: "counterparty" }, "Counterparty scored without OFAC sanctions data — confidence capped at 0.3");
+  // 1. Sanctions Screening (40%)
+  let sanctionsScore = 95;
+  if (sanctions.sanctioned) {
+    sanctionsScore = 0;
+    riskFlags.push("ADDRESS IS ON OFAC SDN SANCTIONS LIST - DO NOT INTERACT");
   }
+  if (addressSecurity.available && addressSecurity.is_sanctioned) {
+    sanctionsScore = 0;
+    riskFlags.push("Address flagged as sanctioned by GoPlus");
+  }
+  if (!sanctions.list_loaded) {
+    sanctionsScore = 50;
+    riskFlags.push("Sanctions list not loaded - screening incomplete");
+  }
+  dimensions.sanctions_screening = {
+    score: sanctionsScore,
+    detail: sanctions.sanctioned
+      ? `SANCTIONED on ${sanctions.list}`
+      : `Not found on OFAC SDN list (${sanctions.addresses_indexed} addresses screened)`,
+  };
+
+  // 2. Address Reputation (30%)
+  let reputationScore = 80;
+  if (addressSecurity.available) {
+    if (addressSecurity.is_malicious_address) { reputationScore = 5; riskFlags.push("Flagged as malicious address"); }
+    if (addressSecurity.is_phishing) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with phishing activities"); }
+    if (addressSecurity.is_cybercrime) { reputationScore = Math.min(reputationScore, 10); riskFlags.push("Associated with cybercrime"); }
+    if (addressSecurity.is_money_laundering) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with money laundering"); }
+    if (addressSecurity.is_darkweb) { reputationScore = Math.min(reputationScore, 15); riskFlags.push("Associated with darkweb transactions"); }
+    if (addressSecurity.is_financial_crime) { reputationScore = Math.min(reputationScore, 20); riskFlags.push("Associated with financial crime"); }
+    if (addressSecurity.is_mixer) { reputationScore = Math.min(reputationScore, 30); riskFlags.push("Associated with mixer/tumbler usage"); }
+    if (addressSecurity.is_blacklisted) { reputationScore = Math.min(reputationScore, 25); riskFlags.push("Address is on blacklist"); }
+  } else {
+    reputationScore = 60; // Unknown = moderate risk
+  }
+  dimensions.address_reputation = {
+    score: reputationScore,
+    detail: addressSecurity.available
+      ? (reputationScore >= 70 ? "No negative reputation signals detected" : "Negative reputation signals detected")
+      : "Address reputation data unavailable",
+  };
+
+  // 3. Exploit Association (20%)
+  let exploitScore = 90;
+  if (exploitAssoc.associated) {
+    exploitScore = 20;
+    riskFlags.push(`Associated with exploited protocol: ${exploitAssoc.protocol_name} (hacked ${exploitAssoc.hack_date || "date unknown"})`);
+  }
+  dimensions.exploit_association = {
+    score: exploitScore,
+    detail: exploitAssoc.associated
+      ? `Associated with ${exploitAssoc.protocol_name} exploit`
+      : "No exploit associations found",
+  };
+
+  // 4. Address Type (10%)
+  let typeScore = 70;
+  if (addressSecurity.available && addressSecurity.is_contract) {
+    typeScore = 60; // Contracts are slightly riskier as counterparties
+    riskFlags.push("Address is a contract, not an EOA");
+  } else if (addressSecurity.available) {
+    typeScore = 80; // EOA is typical
+  }
+  dimensions.address_type = {
+    score: typeScore,
+    detail: addressSecurity.available
+      ? (addressSecurity.is_contract ? "Contract address" : "Externally owned account (EOA)")
+      : "Address type unknown",
+  };
+
+  // Weighted composite
+  const weights = { sanctions_screening: 0.40, address_reputation: 0.30, exploit_association: 0.20, address_type: 0.10 };
+  const compositeScore = Math.round(
+    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
+  );
+  const { grade, verdict } = gradeFromScore(compositeScore);
 
   return {
     address,
     chain,
-    verdict: sanctions.degraded ? "CAUTION" : scored.verdict,
-    trust_grade: sanctions.degraded ? "C" : scored.grade,
-    trust_score: scored.compositeScore,
-    confidence,
+    verdict,
+    trust_grade: grade,
+    trust_score: compositeScore,
+    confidence: sanctions.list_loaded && addressSecurity.available ? 0.90 : 0.55,
     evidence: {
       sanctions: {
         sanctioned: sanctions.sanctioned,
         list: sanctions.list,
         addresses_screened: sanctions.addresses_indexed,
-        screening_degraded: sanctions.degraded,
       },
       reputation: addressSecurity.available ? {
         is_malicious: addressSecurity.is_malicious_address,
@@ -1021,13 +1103,12 @@ async function scoreCounterparty(address, chain, skipOfac = false) {
       } : { available: false },
       exploit_association: exploitAssoc,
     },
-    dimensions: scored.dimensions,
+    dimensions,
     risk_flags: riskFlags,
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
       sentinel_version: VERSION,
-      warnings: sanctions.degraded ? ["OFAC sanctions screening unavailable — sanctions list failed to load. Confidence has been capped. Counterparty safety cannot be fully verified."] : [],
     },
   };
 }
@@ -1043,31 +1124,154 @@ async function scoreCounterparty(address, chain, skipOfac = false) {
 async function scoreProtocol(contractAddress, chain) {
   const startTime = Date.now();
 
-  // Fetch all data in parallel (contract metadata cached 24h — deployment data never changes)
+  // Fetch all data in parallel
   const [audit, exploits, contract, tvl] = await Promise.all([
     getAuditData(contractAddress, chain),
     getExploitHistory(contractAddress, chain),
-    cachedCall(
-      `sentinel:contract:${contractAddress.toLowerCase()}:${chain}`,
-      CACHE_TTL.contractMetadata,
-      () => getContractMetadata(contractAddress, chain)
-    ),
+    getContractMetadata(contractAddress, chain),
     getTvlData(contractAddress),
   ]);
 
-  // Get protocol metadata from registry
-  const protocolMeta = protocolRegistry[contractAddress.toLowerCase()] || {};
+  // Score each dimension (0-100)
+  const dimensions = {};
 
-  // Delegate scoring to private engine
-  const scored = scoreProtocolDimensions(audit, exploits, contract, tvl, protocolMeta);
+  // Audit (25%)
+  if (audit.audited) {
+    let score = 80;
+    if (audit.auditors.length >= 2) score += 10;
+    if (audit.monthsSinceAudit && audit.monthsSinceAudit < 6) score += 5;
+    if (audit.monthsSinceAudit && audit.monthsSinceAudit > 18) score -= 15;
+    dimensions.audit = { score: Math.min(100, Math.max(0, score)), detail: `Audited by ${audit.auditors.join(", ")}. Last audit: ${audit.monthsSinceAudit} months ago.` };
+  } else {
+    dimensions.audit = { score: 15, detail: "No audit records found." };
+  }
+
+  // Exploit history (25%)
+  if (exploits.exploited) {
+    const resolved = exploits.incidents.every(i => i.resolved);
+    dimensions.exploit_history = {
+      score: resolved ? 35 : 5,
+      detail: `${exploits.incidents.length} exploit(s) on record. ${resolved ? "All resolved." : "Unresolved incidents."}`,
+    };
+  } else {
+    dimensions.exploit_history = { score: 90, detail: "No exploit history found." };
+  }
+
+  // Contract maturity (15%)
+  let contractScore = 50;
+  if (contract.ageDays && contract.ageDays > 365) contractScore += 20;
+  if (contract.ageDays && contract.ageDays > 180) contractScore += 10;
+  if (contract.verifiedSource) contractScore += 10;
+  if (contract.ownerIsMultisig) contractScore += 10;
+  dimensions.contract_maturity = {
+    score: Math.min(100, contractScore),
+    detail: contract.mock
+      ? "Using estimated contract data (mock mode)"
+      : `Contract age: ${contract.ageDays} days. Source verified: ${contract.verifiedSource}. Multisig: ${contract.ownerIsMultisig}.`,
+  };
+
+  // TVL stability (15%)
+  if (tvl.currentUsd !== null) {
+    let tvlScore = 60;
+    if (tvl.currentUsd > 1_000_000_000) tvlScore += 25;
+    else if (tvl.currentUsd > 100_000_000) tvlScore += 15;
+    else if (tvl.currentUsd > 10_000_000) tvlScore += 5;
+    if (tvl.stable) tvlScore += 10;
+    dimensions.tvl_stability = { score: Math.min(100, tvlScore), detail: `TVL: $${(tvl.currentUsd / 1_000_000).toFixed(0)}M. 30d trend: ${tvl.trend30d}. ${tvl.stable ? "Stable." : "Volatile."}` };
+  } else {
+    dimensions.tvl_stability = { score: 40, detail: "TVL data unavailable." };
+  }
+
+  // Governance risk (10%) - based on registry metadata
+  const protocolMeta = protocolRegistry[contractAddress.toLowerCase()] || {};
+  {
+    let govScore = 50; // baseline
+    const govDetails = [];
+
+    if (protocolMeta.governanceID) {
+      govScore += 25; // Has on-chain/snapshot governance
+      govDetails.push("Active governance system detected");
+    }
+    if (protocolMeta.treasury) {
+      govScore += 10; // Has a treasury (DAO structure)
+      govDetails.push("Protocol treasury exists");
+    }
+    if (contract.ownerIsMultisig) {
+      govScore += 10; // Multisig ownership = decentralized control
+      govDetails.push("Multisig ownership");
+    }
+    if (protocolMeta.openSource) {
+      govScore += 5;
+      govDetails.push("Open source");
+    }
+
+    dimensions.governance = {
+      score: Math.min(100, Math.max(0, govScore)),
+      detail: govDetails.length > 0 ? govDetails.join(". ") + "." : "No governance signals available.",
+    };
+  }
+
+  // Community signal (10%) - based on ecosystem presence
+  {
+    let commScore = 40; // baseline
+    const commDetails = [];
+
+    if (protocolMeta.twitter) {
+      commScore += 10;
+      commDetails.push("Social presence verified");
+    }
+    if (protocolMeta.url) {
+      commScore += 5;
+      commDetails.push("Active website");
+    }
+    if (protocolMeta.listedAt) {
+      // Longer listing on DeFiLlama = more established community
+      const listedDaysAgo = (Date.now() / 1000 - protocolMeta.listedAt) / 86400;
+      if (listedDaysAgo > 730) { commScore += 20; commDetails.push("Established for 2+ years"); }
+      else if (listedDaysAgo > 365) { commScore += 15; commDetails.push("Established for 1+ year"); }
+      else if (listedDaysAgo > 90) { commScore += 5; commDetails.push("Listed for 3+ months"); }
+    }
+    if (protocolMeta.mcap && protocolMeta.mcap > 100_000_000) {
+      commScore += 15;
+      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
+    } else if (protocolMeta.mcap && protocolMeta.mcap > 10_000_000) {
+      commScore += 10;
+      commDetails.push(`Market cap: $${(protocolMeta.mcap / 1_000_000).toFixed(0)}M`);
+    }
+    if (protocolMeta.forkedFrom && protocolMeta.forkedFrom.length > 0) {
+      commScore += 5; // Fork of established protocol
+      commDetails.push(`Fork of ${protocolMeta.forkedFrom[0]}`);
+    }
+
+    dimensions.community = {
+      score: Math.min(100, Math.max(0, commScore)),
+      detail: commDetails.length > 0 ? commDetails.join(". ") + "." : "No community signals available.",
+    };
+  }
+
+  // Compute composite
+  const weights = { audit: 0.25, exploit_history: 0.25, contract_maturity: 0.15, tvl_stability: 0.15, governance: 0.10, community: 0.10 };
+  const compositeScore = Math.round(
+    Object.entries(weights).reduce((sum, [key, weight]) => sum + (dimensions[key]?.score || 0) * weight, 0)
+  );
+
+  // Identify risk flags
+  const riskFlags = [];
+  if (!audit.audited) riskFlags.push("No audit records found - high risk");
+  if (exploits.exploited) riskFlags.push(`Previous exploit: ${exploits.incidents[0]?.type || "unknown type"}`);
+  if (contract.proxyPattern) riskFlags.push(`Proxy contract (${contract.proxyPattern}) - admin upgrade possible`);
+  if (audit.monthsSinceAudit && audit.monthsSinceAudit > 12) riskFlags.push(`Audit is ${audit.monthsSinceAudit} months old - may not reflect current code`);
+  if (tvl.currentUsd !== null && tvl.currentUsd < 10_000_000) riskFlags.push("TVL below $10M - limited liquidity");
+
+  const { grade, verdict } = gradeFromScore(compositeScore);
 
   return {
     address: contractAddress,
     chain,
-    verdict: scored.verdict,
-    trust_grade: scored.grade,
-    trust_score: scored.compositeScore,
-    confidence: scored.confidence,
+    verdict,
+    trust_grade: grade,
+    trust_score: compositeScore,
+    confidence: contract.mock ? 0.45 : 0.88,
     evidence: {
       audit: {
         audited: audit.audited,
@@ -1091,13 +1295,13 @@ async function scoreProtocol(contractAddress, chain) {
         stable: tvl.stable,
       },
     },
-    dimensions: scored.dimensions,
-    risk_flags: scored.riskFlags,
+    dimensions,
+    risk_flags: riskFlags,
     meta: {
       response_time_ms: Date.now() - startTime,
       data_freshness: new Date().toISOString(),
       sentinel_version: VERSION,
-      contract_metadata_degraded: !!contract.degraded,
+      mock_data: !!contract.mock,
     },
   };
 }
@@ -1322,23 +1526,9 @@ const schemes = [
   { network: "eip155:8453",  server: new ExactEvmScheme() },  // Base Mainnet
 ];
 
-// ── Local bypass for internal agents (skips x402 payment) ──
-// Set LOCAL_BYPASS_SECRET in .env and pass it via x-bypass-secret header.
-// Only affects requests that present the correct secret — public users still pay.
-const LOCAL_BYPASS_SECRET = process.env.LOCAL_BYPASS_SECRET || "";
-const BYPASS_PATHS = ["/verify/protocol", "/verify/token", "/verify/position", "/verify/counterparty", "/preflight"];
-
-// Wrap x402 payment middleware so bypass requests skip it entirely
-const x402Middleware = paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes);
-app.use((req, res, next) => {
-  if (LOCAL_BYPASS_SECRET && req.headers["x-bypass-secret"] === LOCAL_BYPASS_SECRET && BYPASS_PATHS.some(p => req.path === p)) {
-    return next();  // Skip x402 payment
-  }
-  x402Middleware(req, res, next);  // Normal x402 payment flow
-});
-if (LOCAL_BYPASS_SECRET) {
-  console.log("[sentinel] Local bypass enabled for internal agents");
-}
+// Sync with facilitator on startup so the middleware learns what payment
+// schemes / networks are supported (required for 402 responses to work).
+app.use(paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes));
 
 
 // ============================================================
@@ -1349,11 +1539,6 @@ const PAID_PATHS = ["/verify/protocol", "/verify/token", "/verify/position", "/v
 
 app.use(PAID_PATHS, async (req, res, next) => {
   if (!ratelimit) return next(); // Skip if Redis not configured
-
-  // Internal agents with bypass secret skip rate limiting
-  if (LOCAL_BYPASS_SECRET && req.headers["x-bypass-secret"] === LOCAL_BYPASS_SECRET) {
-    return next();
-  }
 
   // Identify caller by x-payer-address header (set by x402 after payment)
   // or fall back to IP address for non-paying requests
@@ -1379,7 +1564,7 @@ app.use(PAID_PATHS, async (req, res, next) => {
     }
   } catch (err) {
     // If rate limiter fails, let the request through (fail-open)
-    logger.error({ err }, "Rate limiter error (failing open)");
+    console.error("Rate limiter error (failing open):", err.message);
   }
 
   next();
@@ -1387,90 +1572,8 @@ app.use(PAID_PATHS, async (req, res, next) => {
 
 
 // ============================================================
-// REQUEST LOGGING MIDDLEWARE (non-blocking, fail-silent)
-// Logs every paid + discovery request to Postgres request_log
-// ============================================================
-
-app.use(createRequestLogger({
-  alchemyApiKey: ALCHEMY_API_KEY,
-  network: NETWORK,
-}));
-
-
-// ============================================================
-// ADMIN ROUTES (protected by SENTINEL_ADMIN_KEY)
-// ============================================================
-
-const SENTINEL_ADMIN_KEY = process.env.SENTINEL_ADMIN_KEY || "";
-app.use("/admin", createAdminRouter(SENTINEL_ADMIN_KEY));
-
-
-// ============================================================
 // API ENDPOINTS
 // ============================================================
-
-/**
- * Extract payer wallet from x402 payment context.
- * The x402 middleware sets x-payer-address header after payment verification.
- */
-function getPayerWallet(req) {
-  const addr = req.headers["x-payer-address"];
-  return addr && addr.startsWith("0x") ? addr.toLowerCase() : null;
-}
-
-/**
- * Load agent reputation context for a request.
- * Returns { payerWallet, agentProfile, tier, tierTTLs, skipOfac }
- */
-async function loadAgentContext(req) {
-  const payerWallet = getPayerWallet(req);
-  if (!payerWallet) {
-    return { payerWallet: null, agentProfile: null, tier: "unknown", tierTTLs: CACHE_TTL, skipOfac: false };
-  }
-  const agentProfile = await getAgentProfile(payerWallet).catch(() => null);
-  const tier = agentProfile?.tier || "unknown";
-  const tierTTLs = getTierCacheTTLs(tier, CACHE_TTL);
-  const skipOfac = agentProfile ? shouldSkipOfacRecheck(agentProfile) : false;
-  return { payerWallet, agentProfile, tier, tierTTLs, skipOfac };
-}
-
-/**
- * Fire-and-forget post-response agent profile update.
- */
-function updateAgentPostResponse(payerWallet, result) {
-  if (!payerWallet) return;
-  updateAgentProfile(payerWallet, {
-    verdict: result.verdict,
-    riskFlags: result.risk_flags || [],
-    ofacClean: !(result.risk_flags || []).includes("OFAC_SCREENING_UNAVAILABLE") && !(result.risk_flags || []).includes("SANCTIONED"),
-  }).catch(() => {});
-}
-
-/**
- * Fire-and-forget audit log write.
- */
-function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chain, result, startTime, dataSources, price }) {
-  writeAuditLog({
-    agent_wallet: payerWallet,
-    agent_tier: tier,
-    ip_address: req.ip,
-    endpoint,
-    target_address: target,
-    chain,
-    request_params: { chain, detail: req.query?.detail || req.body?.detail },
-    verdict: result.verdict,
-    trust_score: result.trust_score || result.composite_score,
-    trust_grade: result.trust_grade,
-    risk_flags: result.risk_flags || [],
-    proceed: result.verdict !== "UNSAFE" && result.verdict !== "DANGER",
-    response_time_ms: Date.now() - startTime,
-    cache_hit: result.meta?.cache_hit || false,
-    x402_payment_amount: price,
-    x402_payment_verified: true,
-    data_sources_used: dataSources,
-    degraded_sources: (result.risk_flags || []).includes("OFAC_SCREENING_UNAVAILABLE") ? ["ofac"] : [],
-  });
-}
 
 /**
  * /verify/protocol - $0.008 per call
@@ -1485,23 +1588,13 @@ app.post("/verify/protocol", async (req, res) => {
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
-  const startTime = Date.now();
-  const { payerWallet, tier, tierTTLs } = await loadAgentContext(req);
 
   try {
     const cacheKey = `sentinel:protocol:${address.toLowerCase()}:${chain}`;
-    const result = await cachedCall(cacheKey, tierTTLs.protocol, () => scoreProtocol(address, chain));
-
-    if (result.meta) { result.meta.agent_tier = tier; result.meta.cache_ttl_applied = tierTTLs.protocol; }
+    const result = await cachedCall(cacheKey, CACHE_TTL.protocol, () => scoreProtocol(address, chain));
     res.json(filterResponse(result, detailLevel));
-
-    if (isEASEnabled() && result.trust_score !== undefined) {
-      createVerificationAttestation({ target: address, chain, endpointType: "protocol", trustScore: Math.min(255, Math.max(0, Math.round(result.trust_score))), verdict: result.verdict || "UNKNOWN", trustGrade: result.trust_grade || "N/A", proceed: result.verdict !== "UNSAFE" && result.verdict !== "DANGER", riskFlags: (result.risk_flags || []).join(","), timestamp: Math.floor(Date.now() / 1000), x402PaymentId: 0 }, logger).catch(err => logger.error({ err: err.message, target: address }, "Attestation write failed"));
-    }
-    updateAgentPostResponse(payerWallet, result);
-    writeAuditPostResponse(req, { payerWallet, tier, endpoint: "protocol", target: address, chain, result, startTime, dataSources: ["etherscan", "defilama", "alchemy"], price: "$0.008" });
   } catch (error) {
-    logger.error({ err: error, endpoint: "/verify/protocol", address, chain }, "Protocol verification failed");
+    console.error("Protocol verification error:", error);
     res.status(500).json({ error: "Protocol verification failed. Please try again later." });
   }
 });
@@ -1519,29 +1612,13 @@ app.post("/verify/position", async (req, res) => {
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
-  const { payerWallet, tier, tierTTLs } = await loadAgentContext(req);
 
   try {
     const cacheKey = `sentinel:position:${protocolAddress.toLowerCase()}:${chain}`;
-    const result = await cachedCall(cacheKey, tierTTLs.position, () => analyzePosition(protocolAddress, user || null, chain));
-
-    if (result.meta) { result.meta.agent_tier = tier; result.meta.cache_ttl_applied = tierTTLs.position; }
+    const result = await cachedCall(cacheKey, CACHE_TTL.position, () => analyzePosition(protocolAddress, user || null, chain));
     res.json(filterResponse(result, detailLevel));
-
-    if (isEASEnabled() && result.trust_score !== undefined) {
-      createVerificationAttestation({
-        target: protocolAddress, chain, endpointType: "position",
-        trustScore: Math.min(255, Math.max(0, Math.round(result.trust_score))),
-        verdict: result.verdict || "UNKNOWN", trustGrade: result.trust_grade || "N/A",
-        proceed: result.verdict !== "UNSAFE" && result.verdict !== "DANGER",
-        riskFlags: (result.risk_flags || []).join(","),
-        timestamp: Math.floor(Date.now() / 1000), x402PaymentId: 0,
-      }, logger).catch(err => logger.error({ err: err.message, target: protocolAddress }, "Attestation write failed"));
-    }
-    updateAgentPostResponse(payerWallet, result);
-    writeAuditPostResponse(req, { payerWallet, tier, endpoint: "position", target: protocolAddress, chain, result, startTime: Date.now(), dataSources: ["etherscan", "defilama"], price: "$0.005" });
   } catch (error) {
-    logger.error({ err: error, endpoint: "/verify/position", protocol: protocolAddress, chain }, "Position analysis failed");
+    console.error("Position analysis error:", error);
     res.status(500).json({ error: "Position analysis failed. Please try again later." });
   }
 });
@@ -1558,29 +1635,12 @@ app.post("/verify/counterparty", async (req, res) => {
     return res.status(400).json({ error: "Valid address required (0x + 40 hex characters)" });
   }
 
-  const { payerWallet, tier, tierTTLs, skipOfac } = await loadAgentContext(req);
-
   try {
     const cacheKey = `sentinel:counterparty:${address.toLowerCase()}:${chain}`;
-    const result = await cachedCall(cacheKey, tierTTLs.counterparty, () => scoreCounterparty(address, chain, skipOfac));
-
-    if (result.meta) { result.meta.agent_tier = tier; result.meta.cache_ttl_applied = tierTTLs.counterparty; result.meta.ofac_skipped = skipOfac; }
+    const result = await cachedCall(cacheKey, CACHE_TTL.counterparty, () => scoreCounterparty(address, chain));
     res.json(filterResponse(result, DETAIL_LEVELS.includes(detail) ? detail : "full"));
-
-    if (isEASEnabled() && result.trust_score !== undefined) {
-      createVerificationAttestation({
-        target: address, chain, endpointType: "counterparty",
-        trustScore: Math.min(255, Math.max(0, Math.round(result.trust_score))),
-        verdict: result.verdict || "UNKNOWN", trustGrade: result.trust_grade || "N/A",
-        proceed: result.verdict !== "UNSAFE" && result.verdict !== "DANGER",
-        riskFlags: (result.risk_flags || []).join(","),
-        timestamp: Math.floor(Date.now() / 1000), x402PaymentId: 0,
-      }, logger).catch(err => logger.error({ err: err.message, target: address }, "Attestation write failed"));
-    }
-    updateAgentPostResponse(payerWallet, result);
-    writeAuditPostResponse(req, { payerWallet, tier, endpoint: "counterparty", target: address, chain, result, startTime: Date.now(), dataSources: ["ofac", "goplus", "exploits"], price: "$0.010" });
   } catch (error) {
-    logger.error({ err: error, endpoint: "/verify/counterparty", address, chain }, "Counterparty verification failed");
+    console.error("Counterparty verification error:", error);
     res.status(500).json({ error: "Counterparty verification failed. Please try again later." });
   }
 });
@@ -1590,7 +1650,6 @@ app.post("/verify/counterparty", async (req, res) => {
  * Token safety assessment: honeypot, tax, ownership, holder distribution
  */
 app.post("/verify/token", async (req, res) => {
-  const startTime = Date.now();
   const params = { ...req.query, ...req.body };
   const { address, chain = "base", detail = "full" } = params;
 
@@ -1599,11 +1658,10 @@ app.post("/verify/token", async (req, res) => {
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
-  const { payerWallet, tier, tierTTLs } = await loadAgentContext(req);
 
   try {
     const cacheKey = `sentinel:token:${address.toLowerCase()}:${chain}`;
-    const fullResult = await cachedCall(cacheKey, tierTTLs.token, async () => {
+    const fullResult = await cachedCall(cacheKey, CACHE_TTL.token, async () => {
       const [security, market] = await Promise.all([
         getTokenSecurity(address, chain),
         getTokenMarketData(address),
@@ -1640,30 +1698,16 @@ app.post("/verify/token", async (req, res) => {
           } : { available: false },
         },
         meta: {
-          response_time_ms: Date.now() - startTime,
+          response_time_ms: Date.now(),
           data_freshness: new Date().toISOString(),
           sentinel_version: VERSION,
         },
       };
     });
 
-    if (fullResult.meta) { fullResult.meta.agent_tier = tier; fullResult.meta.cache_ttl_applied = tierTTLs.token; }
     res.json(filterResponse(fullResult, detailLevel));
-
-    if (isEASEnabled() && fullResult.trust_score !== undefined) {
-      createVerificationAttestation({
-        target: address, chain, endpointType: "token",
-        trustScore: Math.min(255, Math.max(0, Math.round(fullResult.trust_score))),
-        verdict: fullResult.verdict || "UNKNOWN", trustGrade: fullResult.trust_grade || "N/A",
-        proceed: fullResult.verdict !== "UNSAFE" && fullResult.verdict !== "DANGER",
-        riskFlags: (fullResult.risk_flags || []).join(","),
-        timestamp: Math.floor(Date.now() / 1000), x402PaymentId: 0,
-      }, logger).catch(err => logger.error({ err: err.message, target: address }, "Attestation write failed"));
-    }
-    updateAgentPostResponse(payerWallet, fullResult);
-    writeAuditPostResponse(req, { payerWallet, tier, endpoint: "token", target: address, chain, result: fullResult, startTime, dataSources: ["goplus", "defilama"], price: "$0.005" });
   } catch (error) {
-    logger.error({ err: error, endpoint: "/verify/token", token: params.token, chain: params.chain }, "Token verification failed");
+    console.error("Token verification error:", error);
     res.status(500).json({ error: "Token verification failed. Please try again later." });
   }
 });
@@ -1690,115 +1734,132 @@ app.post("/preflight", async (req, res) => {
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
   const startTime = Date.now();
-  const { payerWallet, tier, tierTTLs, skipOfac } = await loadAgentContext(req);
 
   try {
-    // Cache key includes all inputs that affect the result (NOT detail level — that's display only)
-    const cacheKey = `sentinel:preflight:${target.toLowerCase()}:${(token || "none").toLowerCase()}:${(counterparty || "none").toLowerCase()}:${chain}`;
+    // Run all checks in parallel — only protocol is mandatory
+    const checks = await Promise.allSettled([
+      scoreProtocol(target, chain),
+      token ? (async () => {
+        const [security, market] = await Promise.all([
+          getTokenSecurity(token, chain),
+          getTokenMarketData(token),
+        ]);
+        const scored = scoreToken(security, market);
+        return { address: token, token_name: security.token_name, token_symbol: security.token_symbol, ...scored };
+      })() : Promise.resolve(null),
+      counterparty ? scoreCounterparty(counterparty, chain) : Promise.resolve(null),
+      analyzePosition(target, counterparty || null, chain),
+    ]);
 
-    const result = await cachedCall(cacheKey, tierTTLs.preflight, async () => {
-      // OPTIMIZATION: Score protocol ONCE, then reuse for position analysis.
-      // Previously, scoreProtocol was called twice (directly + inside analyzePosition),
-      // duplicating all Etherscan, Alchemy, and DeFiLlama calls. This fix reduces
-      // /preflight latency by ~50% on cache misses. — 2026-04-02
-      const protocolResult = await scoreProtocol(target, chain).catch(() => null);
+    const [protocolResult, tokenResult, counterpartyResult, positionResult] = checks.map(
+      (r) => r.status === "fulfilled" ? r.value : null
+    );
 
-      // Run remaining checks in parallel — protocol result is reused by analyzePosition
-      const checks = await Promise.allSettled([
-        token ? (async () => {
-          const [security, market] = await Promise.all([
-            getTokenSecurity(token, chain),
-            getTokenMarketData(token),
-          ]);
-          const scored = scoreToken(security, market);
-          return { address: token, token_name: security.token_name, token_symbol: security.token_symbol, ...scored };
-        })() : Promise.resolve(null),
-        counterparty ? scoreCounterparty(counterparty, chain, skipOfac) : Promise.resolve(null),
-        analyzePosition(target, counterparty || null, chain, protocolResult),
-      ]);
+    // Build component summary
+    const components = {
+      protocol: protocolResult ? {
+        verdict: protocolResult.verdict,
+        grade: protocolResult.trust_grade,
+        score: protocolResult.trust_score,
+        risk_flags: protocolResult.risk_flags,
+      } : { verdict: "ERROR", grade: "N/A", score: null, risk_flags: ["Protocol check failed"] },
 
-      const [tokenResult, counterpartyResult, positionResult] = checks.map(
-        (r) => r.status === "fulfilled" ? r.value : null
-      );
+      token: tokenResult ? {
+        verdict: tokenResult.verdict,
+        grade: tokenResult.trust_grade,
+        score: tokenResult.trust_score,
+        name: tokenResult.token_name,
+        symbol: tokenResult.token_symbol,
+        risk_flags: tokenResult.risk_flags,
+      } : null,
 
-      // Build component summary
-      const components = {
-        protocol: protocolResult ? {
-          verdict: protocolResult.verdict,
-          grade: protocolResult.trust_grade,
-          score: protocolResult.trust_score,
-          risk_flags: protocolResult.risk_flags,
-        } : { verdict: "ERROR", grade: "N/A", score: null, risk_flags: ["Protocol check failed"] },
+      counterparty: counterpartyResult ? {
+        verdict: counterpartyResult.verdict,
+        grade: counterpartyResult.trust_grade,
+        score: counterpartyResult.trust_score,
+        risk_flags: counterpartyResult.risk_flags,
+      } : null,
 
-        token: tokenResult ? {
-          verdict: tokenResult.verdict,
-          grade: tokenResult.trust_grade,
-          score: tokenResult.trust_score,
-          name: tokenResult.token_name,
-          symbol: tokenResult.token_symbol,
-          risk_flags: tokenResult.risk_flags,
-        } : null,
+      position: positionResult ? {
+        verdict: positionResult.verdict,
+        grade: positionResult.trust_grade,
+        score: positionResult.trust_score,
+        risk_flags: positionResult.risk_flags,
+        recommendations: positionResult.recommendations,
+      } : null,
+    };
 
-        counterparty: counterpartyResult ? {
-          verdict: counterpartyResult.verdict,
-          grade: counterpartyResult.trust_grade,
-          score: counterpartyResult.trust_score,
-          risk_flags: counterpartyResult.risk_flags,
-        } : null,
+    // Compute composite score — weighted by what checks were actually run
+    // Protocol is always heaviest; others scale if present
+    const scores = [];
+    const weights = [];
 
-        position: positionResult ? {
-          verdict: positionResult.verdict,
-          grade: positionResult.trust_grade,
-          score: positionResult.trust_score,
-          risk_flags: positionResult.risk_flags,
-          recommendations: positionResult.recommendations,
-        } : null,
-      };
+    if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
+    if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
+    if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
+    if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
 
-      // Delegate composite scoring to private engine
-      const preflight = computePreflightComposite(components);
+    // Normalize weights to sum to 1.0
+    const weightSum = weights.reduce((a, b) => a + b, 0);
+    const compositeScore = Math.round(
+      scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0)
+    );
+    const { grade, verdict } = gradeFromScore(compositeScore);
 
-      return {
-        target,
-        token: token || null,
-        counterparty: counterparty || null,
-        chain,
-        verdict: preflight.verdict,
-        trust_grade: preflight.grade,
-        composite_score: preflight.compositeScore,
-        proceed: preflight.proceed,
-        proceed_recommendation: preflight.proceedRecommendation,
-        checks_summary: {
-          protocol: components.protocol.grade,
-          token: components.token?.grade || "not_checked",
-          counterparty: components.counterparty?.grade || "not_checked",
-          position: components.position?.grade || "not_checked",
-        },
-        risk_flags: preflight.allRiskFlags,
-        components,
-        recommendations: positionResult?.recommendations || [],
-        meta: {
-          response_time_ms: Date.now() - startTime,
-          data_freshness: new Date().toISOString(),
-          sentinel_version: VERSION,
-          checks_run: [
-            "protocol",
-            token ? "token" : null,
-            counterparty ? "counterparty" : null,
-            "position",
-          ].filter(Boolean),
-          attestation_enabled: isEASEnabled(),
-          agent_tier: tier,
-          cache_ttl_applied: tierTTLs.preflight,
-          ofac_skipped: skipOfac,
-        },
-      };
-    });
+    // Aggregate all risk flags
+    const allRiskFlags = [
+      ...(components.protocol.risk_flags || []),
+      ...(components.token?.risk_flags || []),
+      ...(components.counterparty?.risk_flags || []),
+      ...(components.position?.risk_flags || []),
+    ];
 
-    // Override response_time_ms to reflect actual time (including cache lookup)
-    result.meta.response_time_ms = Date.now() - startTime;
+    // Hard blockers: sanctions or honeypot override the composite
+    const hardBlock = allRiskFlags.some(f =>
+      f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED")
+    );
+    const finalVerdict = hardBlock ? "DANGER" : verdict;
+    const finalGrade = hardBlock ? "F" : grade;
+    const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
 
-    // Apply detail filtering (outside cache — detail is a display preference)
+    // Proceed recommendation
+    const proceed = !hardBlock && finalScore >= 40;
+
+    const result = {
+      target,
+      token: token || null,
+      counterparty: counterparty || null,
+      chain,
+      verdict: finalVerdict,
+      trust_grade: finalGrade,
+      composite_score: finalScore,
+      proceed,
+      proceed_recommendation: proceed
+        ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags")
+        : "DO NOT PROCEED — elevated risk detected",
+      checks_summary: {
+        protocol: components.protocol.grade,
+        token: components.token?.grade || "not_checked",
+        counterparty: components.counterparty?.grade || "not_checked",
+        position: components.position?.grade || "not_checked",
+      },
+      risk_flags: allRiskFlags,
+      components: detailLevel === "minimal" ? undefined : components,
+      recommendations: positionResult?.recommendations || [],
+      meta: {
+        response_time_ms: Date.now() - startTime,
+        data_freshness: new Date().toISOString(),
+        sentinel_version: VERSION,
+        checks_run: [
+          "protocol",
+          token ? "token" : null,
+          counterparty ? "counterparty" : null,
+          "position",
+        ].filter(Boolean),
+      },
+    };
+
+    // Apply detail filtering
     if (detailLevel === "minimal") {
       res.json({
         target: result.target,
@@ -1817,242 +1878,9 @@ app.post("/preflight", async (req, res) => {
     } else {
       res.json(result);
     }
-
-    // Post-response attestation write (fire-and-forget)
-    if (isEASEnabled() && result.composite_score !== undefined) {
-      createVerificationAttestation({
-        target,
-        chain,
-        endpointType: "preflight",
-        trustScore: Math.min(255, Math.max(0, Math.round(result.composite_score))),
-        verdict: result.verdict || "UNKNOWN",
-        trustGrade: result.trust_grade || "N/A",
-        proceed: result.proceed !== false,
-        riskFlags: (result.risk_flags || []).join(","),
-        timestamp: Math.floor(Date.now() / 1000),
-        x402PaymentId: 0, // TODO: When x402 Signed Receipts ship (PR #935), extract receipt ID from payment middleware and bind here
-      }, logger).catch(err => logger.error({ err: err.message, target }, "Attestation write failed"));
-    }
-    updateAgentPostResponse(payerWallet, result);
-    writeAuditPostResponse(req, { payerWallet, tier, endpoint: "preflight", target, chain, result, startTime, dataSources: ["etherscan", "defilama", "alchemy", "goplus", "ofac"], price: "$0.025" });
   } catch (error) {
-    logger.error({ err: error, endpoint: "/preflight", target: params.target, chain: params.chain }, "Preflight check failed");
+    console.error("Preflight error:", error);
     res.status(500).json({ error: "Preflight check failed. Please try again later." });
-  }
-});
-
-
-// ============================================================
-// ATTESTATION LOOKUP (free — encourages agents to check before paying)
-// ============================================================
-
-const attestationRateLimit = new Map(); // IP -> { count, resetAt }
-
-app.get("/attestation/:address", async (req, res) => {
-  const { address } = req.params;
-  const { chain = "base", type } = req.query;
-
-  if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
-    return res.status(400).json({ error: "Valid address required (0x + 40 hex characters)" });
-  }
-
-  // Simple rate limit: 50 calls per IP per hour
-  const ip = req.ip || "unknown";
-  const now = Date.now();
-  const limit = attestationRateLimit.get(ip);
-  if (limit && limit.resetAt > now) {
-    if (limit.count >= 50) {
-      return res.status(429).json({ error: "Rate limit exceeded (50 calls/hour). Try again later." });
-    }
-    limit.count++;
-  } else {
-    attestationRateLimit.set(ip, { count: 1, resetAt: now + 3600000 });
-  }
-
-  try {
-    const attestations = await getAttestationsByTarget(address);
-    const filtered = type
-      ? attestations.filter(a => a.endpointType === type)
-      : attestations;
-
-    res.json({
-      address,
-      chain,
-      attestations: filtered,
-      count: filtered.length,
-      meta: { sentinel_version: VERSION },
-    });
-  } catch (error) {
-    logger.error({ err: error, endpoint: "/attestation", address }, "Attestation lookup failed");
-    res.status(500).json({ error: "Attestation lookup failed." });
-  }
-});
-
-
-// ============================================================
-// AGENT REPUTATION (free)
-// ============================================================
-
-const agentRateLimit = new Map();
-
-app.get("/agent/:walletAddress", async (req, res) => {
-  const { walletAddress } = req.params;
-
-  if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
-    return res.status(400).json({ error: "Valid wallet address required (0x + 40 hex characters)" });
-  }
-
-  // Rate limit: 50 calls per IP per hour
-  const ip = req.ip || "unknown";
-  const now = Date.now();
-  const limit = agentRateLimit.get(ip);
-  if (limit && limit.resetAt > now) {
-    if (limit.count >= 50) {
-      return res.status(429).json({ error: "Rate limit exceeded (50 calls/hour)." });
-    }
-    limit.count++;
-  } else {
-    agentRateLimit.set(ip, { count: 1, resetAt: now + 3600000 });
-  }
-
-  try {
-    const profile = await getAgentProfile(walletAddress);
-    res.json({
-      wallet: profile.wallet,
-      tier: profile.tier,
-      total_verifications: profile.total_verifications,
-      first_seen: profile.first_seen,
-      last_verification: profile.last_verification,
-      meta: {
-        sentinel_version: VERSION,
-        erc8004_compatible: false,
-      },
-    });
-  } catch (error) {
-    logger.error({ err: error, endpoint: "/agent", wallet: walletAddress }, "Agent profile lookup failed");
-    res.status(500).json({ error: "Agent profile lookup failed." });
-  }
-});
-
-
-// ============================================================
-// MONITORING WATCH MANAGEMENT
-// ============================================================
-
-app.post("/watch", async (req, res) => {
-  const { target, chain = "base", webhook_url, endpoint_type = "protocol" } = req.body || {};
-
-  if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
-    return res.status(400).json({ error: "Valid target address required" });
-  }
-  if (!webhook_url || !webhook_url.startsWith("https://")) {
-    return res.status(400).json({ error: "Valid HTTPS webhook URL required" });
-  }
-  if (!["protocol", "token", "counterparty"].includes(endpoint_type)) {
-    return res.status(400).json({ error: "endpoint_type must be one of: protocol, token, counterparty" });
-  }
-
-  const payerWallet = getPayerWallet(req);
-  if (!payerWallet) {
-    return res.status(401).json({ error: "Payment required to create a watch subscription" });
-  }
-
-  const profile = await getAgentProfile(payerWallet).catch(() => null);
-  const tier = profile?.tier || "unknown";
-  if (tier === "unknown") {
-    return res.status(403).json({
-      error: "Watch subscriptions require RECOGNIZED or TRUSTED agent tier. Complete 5+ paid verifications to qualify.",
-      current_tier: tier,
-      total_verifications: profile?.total_verifications || 0,
-      verifications_needed: Math.max(0, 5 - (profile?.total_verifications || 0)),
-    });
-  }
-
-  const result = await addWatch(target, chain, payerWallet, webhook_url, endpoint_type);
-  if (!result.success) {
-    return res.status(409).json({ error: result.error });
-  }
-
-  res.json({
-    watch_id: `${target.toLowerCase()}:${chain}`,
-    subscribed: true,
-    expires_at: result.expires_at,
-    check_interval_hours: 6,
-  });
-});
-
-app.delete("/watch", async (req, res) => {
-  const { target, chain = "base" } = req.body || {};
-
-  if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
-    return res.status(400).json({ error: "Valid target address required" });
-  }
-
-  const payerWallet = getPayerWallet(req);
-  if (!payerWallet) {
-    return res.status(401).json({ error: "Wallet address required" });
-  }
-
-  await removeWatch(target, chain, payerWallet);
-  res.json({ success: true, unsubscribed: true });
-});
-
-app.get("/watch", async (req, res) => {
-  const payerWallet = getPayerWallet(req);
-  if (!payerWallet) {
-    return res.status(401).json({ error: "Wallet address required" });
-  }
-
-  const watches = await getWatchesForAgent(payerWallet);
-  res.json({ watches, count: watches.length });
-});
-
-
-// ============================================================
-// ADMIN COMPLIANCE ENDPOINTS
-// ============================================================
-
-app.get("/admin/audit", async (req, res) => {
-  if (!SENTINEL_ADMIN_KEY || req.headers.authorization !== `Bearer ${SENTINEL_ADMIN_KEY}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  try {
-    const result = await getAuditHistory({
-      agent_wallet: req.query.agent,
-      target_address: req.query.target,
-      verdict: req.query.verdict,
-      endpoint: req.query.endpoint,
-      from: req.query.from,
-      to: req.query.to,
-      limit: parseInt(req.query.limit || "50", 10),
-      offset: parseInt(req.query.offset || "0", 10),
-    });
-
-    res.json({
-      records: result.records,
-      total: result.total,
-      filters_applied: { agent: req.query.agent, target: req.query.target, verdict: req.query.verdict, endpoint: req.query.endpoint, from: req.query.from, to: req.query.to },
-      meta: { sentinel_version: VERSION },
-    });
-  } catch (error) {
-    logger.error({ err: error, endpoint: "/admin/audit" }, "Audit query failed");
-    res.status(500).json({ error: "Audit query failed" });
-  }
-});
-
-app.get("/admin/audit/summary", async (req, res) => {
-  if (!SENTINEL_ADMIN_KEY || req.headers.authorization !== `Bearer ${SENTINEL_ADMIN_KEY}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  try {
-    const period = req.query.period || "30d";
-    const summary = await getAuditSummary(period);
-    res.json({ ...summary, meta: { sentinel_version: VERSION } });
-  } catch (error) {
-    logger.error({ err: error, endpoint: "/admin/audit/summary" }, "Audit summary failed");
-    res.status(500).json({ error: "Audit summary failed" });
   }
 });
 
@@ -2319,10 +2147,6 @@ app.get("/health", (req, res) => {
     facilitator: (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "cdp (coinbase)" : "x402.org",
     cache: redis ? "enabled" : "disabled",
     rate_limit: ratelimit ? "25 calls/wallet/day free tier" : "disabled",
-    attestation_enabled: isEASEnabled(),
-    registry_loaded: registryLoaded,
-    registry_size: Object.keys(protocolRegistry).length,
-    registry_last_refreshed: registryLastRefreshed,
     endpoints: {
       "/verify/protocol":     { price: "$0.008 USDC", status: "live", cache_ttl: "10 min", description: "Protocol trust verification" },
       "/verify/position":     { price: "$0.005 USDC", status: "live", cache_ttl: "5 min",  description: "Position risk analysis" },
@@ -2348,7 +2172,7 @@ if (NETWORK === "base-sepolia") {
       const result = await scoreProtocol(address, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      logger.error({ err: error, endpoint: "/test/protocol", address, chain }, "Test protocol verification failed");
+      console.error("Test protocol verification error:", error);
       res.status(500).json({ error: "Protocol verification failed. Please try again later." });
     }
   });
@@ -2366,7 +2190,7 @@ if (NETWORK === "base-sepolia") {
       const result = scoreToken(security, market);
       res.json(filterResponse({ address, chain, token_name: security.token_name, token_symbol: security.token_symbol, ...result }, detail));
     } catch (error) {
-      logger.error({ err: error, endpoint: "/test/token", token: address, chain }, "Test token verification failed");
+      console.error("Test token verification error:", error);
       res.status(500).json({ error: "Token verification failed. Please try again later." });
     }
   });
@@ -2380,7 +2204,7 @@ if (NETWORK === "base-sepolia") {
       const result = await analyzePosition(protocolAddress, user || null, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      logger.error({ err: error, endpoint: "/test/position", protocol: protocolAddress, chain }, "Test position analysis failed");
+      console.error("Test position analysis error:", error);
       res.status(500).json({ error: "Position analysis failed. Please try again later." });
     }
   });
@@ -2394,7 +2218,7 @@ if (NETWORK === "base-sepolia") {
       const result = await scoreCounterparty(address, chain);
       res.json(filterResponse(result, detail));
     } catch (error) {
-      logger.error({ err: error, endpoint: "/test/counterparty", address, chain }, "Test counterparty verification failed");
+      console.error("Test counterparty verification error:", error);
       res.status(500).json({ error: "Counterparty verification failed. Please try again later." });
     }
   });
@@ -2405,18 +2229,18 @@ if (NETWORK === "base-sepolia") {
       return res.status(400).json({ error: "Valid target address required (?target=0x...)" });
     }
     try {
-      // Score protocol once, reuse for position analysis (same optimization as production /preflight)
-      const protocolResult = await scoreProtocol(target, chain).catch(() => null);
+      // Run all checks in parallel
       const checks = await Promise.allSettled([
+        scoreProtocol(target, chain),
         token ? (async () => {
           const [security, market] = await Promise.all([getTokenSecurity(token, chain), getTokenMarketData(token)]);
           const scored = scoreToken(security, market);
           return { address: token, token_name: security.token_name, token_symbol: security.token_symbol, ...scored };
         })() : Promise.resolve(null),
         counterparty ? scoreCounterparty(counterparty, chain) : Promise.resolve(null),
-        analyzePosition(target, counterparty || null, chain, protocolResult),
+        analyzePosition(target, counterparty || null, chain),
       ]);
-      const [tokenResult, counterpartyResult, positionResult] = checks.map(r => r.status === "fulfilled" ? r.value : null);
+      const [protocolResult, tokenResult, counterpartyResult, positionResult] = checks.map(r => r.status === "fulfilled" ? r.value : null);
 
       const components = {
         protocol: protocolResult ? { verdict: protocolResult.verdict, grade: protocolResult.trust_grade, score: protocolResult.trust_score, risk_flags: protocolResult.risk_flags } : { verdict: "ERROR", grade: "N/A", score: null, risk_flags: ["Protocol check failed"] },
@@ -2425,15 +2249,27 @@ if (NETWORK === "base-sepolia") {
         position: positionResult ? { verdict: positionResult.verdict, grade: positionResult.trust_grade, score: positionResult.trust_score, risk_flags: positionResult.risk_flags, recommendations: positionResult.recommendations } : null,
       };
 
-      // Delegate composite scoring to private engine
-      const preflight = computePreflightComposite(components);
+      const scores = [], weights = [];
+      if (components.protocol.score != null) { scores.push(components.protocol.score); weights.push(0.35); }
+      if (components.position?.score != null) { scores.push(components.position.score); weights.push(0.25); }
+      if (components.token?.score != null)    { scores.push(components.token.score);    weights.push(0.20); }
+      if (components.counterparty?.score != null) { scores.push(components.counterparty.score); weights.push(0.20); }
+      const weightSum = weights.reduce((a, b) => a + b, 0);
+      const compositeScore = Math.round(scores.reduce((sum, score, i) => sum + score * (weights[i] / weightSum), 0));
+      const { grade, verdict } = gradeFromScore(compositeScore);
+
+      const allRiskFlags = [...(components.protocol.risk_flags || []), ...(components.token?.risk_flags || []), ...(components.counterparty?.risk_flags || []), ...(components.position?.risk_flags || [])];
+      const hardBlock = allRiskFlags.some(f => f.includes("OFAC SDN SANCTIONS") || f.includes("HONEYPOT DETECTED"));
+      const finalVerdict = hardBlock ? "DANGER" : verdict;
+      const finalGrade = hardBlock ? "F" : grade;
+      const finalScore = hardBlock ? Math.min(compositeScore, 15) : compositeScore;
+      const proceed = !hardBlock && finalScore >= 40;
 
       const result = {
-        target, token: token || null, counterparty: counterparty || null, chain,
-        verdict: preflight.verdict, trust_grade: preflight.grade, composite_score: preflight.compositeScore, proceed: preflight.proceed,
-        proceed_recommendation: preflight.proceedRecommendation,
+        target, token: token || null, counterparty: counterparty || null, chain, verdict: finalVerdict, trust_grade: finalGrade, composite_score: finalScore, proceed,
+        proceed_recommendation: proceed ? (finalScore >= 70 ? "Transaction appears safe to proceed" : "Proceed with caution — review risk flags") : "DO NOT PROCEED — elevated risk detected",
         checks_summary: { protocol: components.protocol.grade, token: components.token?.grade || "not_checked", counterparty: components.counterparty?.grade || "not_checked", position: components.position?.grade || "not_checked" },
-        risk_flags: preflight.allRiskFlags, components, recommendations: positionResult?.recommendations || [],
+        risk_flags: allRiskFlags, components, recommendations: positionResult?.recommendations || [],
         meta: { response_time_ms: Date.now() - startTime, data_freshness: new Date().toISOString(), sentinel_version: VERSION, checks_run: ["protocol", token ? "token" : null, counterparty ? "counterparty" : null, "position"].filter(Boolean) },
       };
       const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
@@ -2441,92 +2277,39 @@ if (NETWORK === "base-sepolia") {
       else if (detailLevel === "standard") { const { components: _c, ...rest } = result; res.json(rest); }
       else { res.json(result); }
     } catch (error) {
-      logger.error({ err: error, endpoint: "/test/preflight", target, chain }, "Test preflight check failed");
+      console.error("Test preflight error:", error);
       res.status(500).json({ error: "Preflight check failed. Please try again later." });
     }
   });
 
-  logger.info({ testRoutes: ["/test/protocol", "/test/token", "/test/position", "/test/counterparty", "/test/preflight"] }, "DEV Test routes enabled");
+  console.log("  [DEV] Test routes enabled: /test/protocol, /test/token, /test/position, /test/counterparty, /test/preflight");
 }
 
 
 // ============================================================
 // START
 // ============================================================
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   const facType = (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "CDP (Coinbase)" : "x402.org";
-  logger.info({
-    version: VERSION,
-    network: NETWORK,
-    facilitator: facType,
-    port: PORT,
-    cache: redis ? "enabled" : "disabled",
-    service: "sentinel",
-  }, "SENTINEL server started — The Trust Layer for Autonomous Agents");
-
-  // Initialize EAS attestation layer (non-blocking)
-  try {
-    await initEAS(logger);
-  } catch (e) {
-    logger.warn({ module: "eas", err: e.message }, "EAS initialization failed — attestations disabled");
-  }
-
-  // Initialize agent reputation store
-  if (redis) {
-    initReputationStore(redis, logger);
-    logger.info({ module: "reputation" }, "Agent reputation store initialized");
-
-    initWatchlist(redis, logger);
-    logger.info({ module: "monitoring" }, "Watchlist initialized");
-  }
-
-  // Initialize Postgres for request logging (non-fatal if unavailable)
-  // MUST happen before audit log init which depends on dbPool
-  const DATABASE_URL = process.env.DATABASE_URL || "";
-  const dbPool = initPool(DATABASE_URL, logger);
-  if (dbPool) {
-    try {
-      await runMigrations(logger);
-      logger.info({ module: "db" }, "Request logging enabled (Postgres)");
-    } catch (e) {
-      logger.warn({ module: "db", err: e.message }, "Postgres migration failed — request logging disabled");
-    }
-  }
-
-  // Initialize monitoring scanner
-  initScanner({ logger, scoreProtocol, scoreCounterparty, VERSION });
-  startScanner();
-
-  // Initialize audit log (uses Postgres pool from above)
-  if (dbPool) {
-    initAuditLog(dbPool, logger);
-    logger.info({ module: "compliance" }, "Audit log initialized");
-
-    // Daily report generator (runs once per day)
-    setInterval(() => {
-      generateDailyReport().then(summary => {
-        if (summary) logger.info({ module: "compliance", ...summary }, "Daily report generated");
-      }).catch(() => {});
-    }, 24 * 60 * 60 * 1000);
-  }
-
-  // Refresh protocol registry every 24 hours
-  const REGISTRY_REFRESH_MS = 24 * 60 * 60 * 1000;
-  setInterval(refreshProtocolRegistry, REGISTRY_REFRESH_MS);
-  logger.info({ intervalHours: 24 }, "Protocol registry auto-refresh scheduled");
+  console.log(`
+  ┌────────────────────────────────────────────┐
+  │  SENTINEL v0.3.0                            │
+  │  The Trust Layer for Autonomous Agents       │
+  │  Verify before you execute.                  │
+  ├────────────────────────────────────────────┤
+  │  Network:     ${NETWORK.padEnd(29)}│
+  │  Facilitator: ${facType.padEnd(29)}│
+  │  Port:        ${String(PORT).padEnd(29)}│
+  │  Cache:       ${(redis ? "enabled" : "disabled").padEnd(29)}│
+  ├────────────────────────────────────────────┤
+  │  LIVE:                                       │
+  │    GET /verify/protocol  ($0.008 USDC)       │
+  │    GET /verify/token     ($0.005 USDC)       │
+  │    GET /verify/position  ($0.005 USDC)       │
+  │    GET /verify/counterparty ($0.01 USDC)     │
+  │    GET /preflight        ($0.025 USDC)       │
+  │  FREE:                                       │
+  │    GET /health                               │
+  └────────────────────────────────────────────┘
+  `);
 });
-
-// ============================================================
-// EXPORTS FOR TESTING
-// ============================================================
-// Re-export scoring functions from lib + server-specific functions
-export {
-  scoreProtocol,
-  scoreToken,
-  scoreCounterparty,
-  gradeFromScore,
-  filterResponse,
-  checkSanctions,
-  checkExploitAssociation,
-  app,
-};

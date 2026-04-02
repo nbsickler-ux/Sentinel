@@ -1,0 +1,221 @@
+
+CLAUDE CODE ENGINEERING BRIEF
+Phase 0: Caching Layer Hardening
+Date: April 2, 2026
+For: Claude Code execution
+From: Opus strategy session (Cowork)
+
+HARD CONSTRAINT: Do NOT read .env files. Do NOT read, copy, move, or log API keys. The existing code loads keys from environment variables at runtime — your code uses process.env references or the existing config pattern, never the keys directly. This applies to all models and tools. Violation of this rule requires explicit user permission in that moment.
+
+Mission
+Eliminate the three most expensive performance gaps identified in the Sentinel API audit: uncached contract metadata (4 chained Etherscan calls per request), uncached /preflight composite results, and a stale protocol registry that never refreshes after startup. These three fixes together should reduce median /preflight latency by 40-60% on repeated queries and cut Etherscan V2 API consumption by ~80%.
+
+Success Criteria
+1. getContractMetadata() results are cached in Redis with 24-hour TTL. Second call for same address returns in <10ms.
+2. /preflight composite results are cached in Redis with 5-minute TTL. Second identical preflight returns in <50ms.
+3. Protocol registry (DeFiLlama /protocols) refreshes automatically every 24 hours without blocking requests.
+4. All three caches degrade gracefully — if Redis is down, behavior is identical to current (direct compute).
+5. Existing tests pass. No changes to endpoint response schemas.
+
+What Already Exists
+Redis is already configured and working in server.js:
+  - `redis` (Upstash Redis client) — initialized at lines 158-175
+  - `cachedCall(cacheKey, ttlSeconds, computeFn)` — generic cache wrapper at lines 189-214
+  - `CACHE_TTL` object at lines 178-183 with protocol (600s), token (300s), position (300s), counterparty (900s)
+  - Rate limiting via `ratelimit` (Upstash Ratelimit) already works
+
+The cachedCall() function handles:
+  - Cache read → return if hit (with meta.cache_hit = true)
+  - Cache miss → compute → non-blocking write → return (with meta.cache_hit = false)
+  - Redis failure → fall through to compute
+
+Protocol registry is loaded at startup via loadProtocolRegistry() (line 227). It populates the `protocolRegistry` object (line 223) which maps contract addresses to {slug, name, category, ...}. The `registryLoaded` flag (line 224) tracks whether it loaded successfully.
+
+Key files:
+  - server.js — All caching infrastructure and the functions to modify
+  - lib/scoring-engine/index.js — Encrypted proprietary scoring. DO NOT MODIFY. Read-only reference.
+  - lib/scoring.js — Scoring helpers. DO NOT MODIFY unless strictly necessary.
+
+Build 1: Cache Contract Metadata (24h TTL)
+
+The Problem
+getContractMetadata() at line 446 of server.js makes 4 sequential Etherscan V2 calls + 1 Alchemy call for EVERY request. Contract metadata (verified source, proxy pattern, age) changes extremely rarely — a contract's deployment date never changes, and source verification is a one-time event. Yet every /verify/protocol and /preflight request re-fetches this data.
+
+The audit found: "4 Etherscan calls made every request; no cache. Cache hits reduce Etherscan latency to zero."
+
+The Fix
+Wrap getContractMetadata() calls with cachedCall() using a 24-hour TTL. The function is called from two places:
+  1. scoreProtocol() at line 968 — calls getContractMetadata(contractAddress, chain)
+  2. That's it. scoreProtocol is the only caller.
+
+Implementation:
+  1. Add a new TTL to the CACHE_TTL object:
+     contractMetadata: 86400   // 24 hours — deployment data never changes
+
+  2. Inside scoreProtocol(), wrap the getContractMetadata call:
+     BEFORE:
+       const contract = await getContractMetadata(contractAddress, chain);
+     AFTER:
+       const contract = await cachedCall(
+         `sentinel:contract:${contractAddress.toLowerCase()}:${chain}`,
+         CACHE_TTL.contractMetadata,
+         () => getContractMetadata(contractAddress, chain)
+       );
+
+  3. IMPORTANT: getContractMetadata returns objects that don't have a `meta` field. The cachedCall() function tries to set result.meta.cache_hit. You need to handle this. Two options:
+     a) Add a meta field to the getContractMetadata return: `return { ...result, meta: {} }` — then cachedCall will set cache_hit on it.
+     b) Or: modify the cache wrapper call to strip the meta injection for this specific case.
+     Option (a) is simpler. Add `meta: {}` to both return paths of getContractMetadata (the normal return at line 550 and the degraded return at line 539).
+
+  4. Verify that consumers of getContractMetadata don't break with the added `meta` field. The only consumer is scoreProtocol(), which destructures specific fields. An extra `meta` field won't affect it.
+
+Do NOT modify getContractMetadata's internal logic — only wrap the call site and add the meta field to returns.
+
+Build 2: Cache /preflight Composite Results (5min TTL)
+
+The Problem
+/preflight is the most expensive endpoint — it calls scoreProtocol(), scoreCounterparty(), and analyzePosition() which together make 8-16 external API calls. The audit found: "Not cached; regenerates all components every call." An agent querying the same target+counterparty+token combination within 5 minutes gets the same result but pays full latency cost.
+
+The Fix
+Cache the final /preflight response at the endpoint handler level. The cache key must include ALL inputs that affect the result.
+
+Implementation:
+  1. Add TTL:
+     CACHE_TTL.preflight = 300   // 5 minutes
+
+  2. At the top of the /preflight handler (line 1477), after input validation but before computation, construct the cache key:
+     const cacheKey = `sentinel:preflight:${target.toLowerCase()}:${(token || "none").toLowerCase()}:${(counterparty || "none").toLowerCase()}:${chain}`;
+
+  3. Wrap the entire computation block in cachedCall():
+     const result = await cachedCall(cacheKey, CACHE_TTL.preflight, async () => {
+       // ... existing computation code (lines 1495-1586) ...
+       // Return the full result object
+       return resultObject;
+     });
+
+  4. After cachedCall returns, apply the detail filtering (lines 1589-1605) as before — detail level is a display preference, not a data difference, so we cache the full result and filter on output.
+
+  5. The response_time_ms in meta should reflect actual time including cache lookup. Keep startTime before the cachedCall. On cache hit, response_time_ms will be ~5-10ms. On cache miss, it will reflect full computation time. Override the cached response_time_ms:
+     result.meta.response_time_ms = Date.now() - startTime;
+
+  6. Apply the same pattern to the test route at /test/preflight (line 1952) if it exists with similar structure.
+
+IMPORTANT: The detail parameter should NOT be part of the cache key. Cache the full result, then filter by detail level on output. This prevents caching 3 separate copies of the same data.
+
+Build 3: Protocol Registry Auto-Refresh (24h)
+
+The Problem
+loadProtocolRegistry() runs once at startup (line 227) and never again. If the server runs for days, the registry becomes stale — new protocols deployed on Base won't get TVL/audit/exploit lookups. The audit flagged: "Protocol registry never refreshed. Loaded at startup only."
+
+The Fix
+Add a periodic background refresh using setInterval. The refresh must NOT block any requests — it loads into a temporary variable and swaps atomically.
+
+Implementation:
+  1. Create a new function refreshProtocolRegistry():
+     async function refreshProtocolRegistry() {
+       try {
+         logger.info({ source: "defilama" }, "Refreshing protocol registry (scheduled)...");
+         const response = await axios.get("https://api.llama.fi/protocols", { timeout: 15000 });
+         const protocols = response.data;
+         const newRegistry = {};
+
+         for (const p of protocols) {
+           const addresses = [];
+           if (p.address) addresses.push(p.address.toLowerCase());
+           if (p.chainAddresses) {
+             for (const [chain, addr] of Object.entries(p.chainAddresses)) {
+               if (typeof addr === "string") addresses.push(addr.toLowerCase());
+             }
+           }
+           for (const addr of addresses) {
+             const cleanAddr = addr.includes(":") ? addr.split(":")[1] : addr;
+             if (cleanAddr && cleanAddr.startsWith("0x")) {
+               newRegistry[cleanAddr] = {
+                 slug: p.slug,
+                 name: p.name,
+                 category: p.category || null,
+                 audits: p.audits || null,
+                 audit_links: p.audit_links || [],
+                 hacked: p.hallmarks?.some(h => h[1]?.toLowerCase().includes("hack")) || false,
+                 governance: p.governanceID ? true : false,
+                 treasury: p.treasury || null,
+               };
+             }
+           }
+         }
+
+         // Atomic swap — no request sees a half-built registry
+         const oldSize = Object.keys(protocolRegistry).length;
+         protocolRegistry = newRegistry;
+         registryLoaded = true;
+         const newSize = Object.keys(protocolRegistry).length;
+         logger.info({ oldSize, newSize, delta: newSize - oldSize }, "Protocol registry refreshed successfully");
+       } catch (error) {
+         logger.error({ err: error }, "Protocol registry refresh failed — keeping existing data");
+         // Do NOT clear protocolRegistry on failure. Stale data > no data.
+       }
+     }
+
+  2. IMPORTANT: This function must mirror the EXACT logic in the existing loadProtocolRegistry(). Read loadProtocolRegistry() carefully (starting line 227) and make sure the field mapping matches. If loadProtocolRegistry includes fields not listed above (like hackDate, hackAmount), include those too. The new function is a copy of the loading logic, not a simplification.
+
+  3. Set up the interval at server startup, after the initial load completes. Place this near the app.listen() block at the bottom of server.js:
+     // Refresh protocol registry every 24 hours
+     const REGISTRY_REFRESH_MS = 24 * 60 * 60 * 1000; // 24 hours
+     setInterval(refreshProtocolRegistry, REGISTRY_REFRESH_MS);
+     logger.info({ intervalHours: 24 }, "Protocol registry auto-refresh scheduled");
+
+  4. Add a health check indicator. In the /health endpoint (line 1866), add registry age:
+     registry_loaded: registryLoaded,
+     registry_size: Object.keys(protocolRegistry).length,
+
+     To track freshness, add a module-level variable:
+     let registryLastRefreshed = null;
+
+     Set it in both loadProtocolRegistry() and refreshProtocolRegistry():
+     registryLastRefreshed = new Date().toISOString();
+
+     Add to /health:
+     registry_last_refreshed: registryLastRefreshed,
+
+Testing Checklist
+After implementing all three builds:
+
+1. Start the server locally (npm run dev) and verify it starts without errors.
+2. Hit /health and confirm:
+   - registry_loaded: true
+   - registry_size > 0
+   - registry_last_refreshed is a valid timestamp
+3. Hit /verify/protocol with a known contract (e.g., Aerodrome Router 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43 on base). Note the response_time_ms.
+4. Hit the same endpoint again. Verify:
+   - Response is identical (minus response_time_ms)
+   - response_time_ms is dramatically lower (should be <50ms vs 2-5s)
+   - meta.cache_hit is true
+5. Hit /preflight with target=0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43&chain=base. Note response_time_ms.
+6. Hit the same /preflight again. Verify cache_hit and fast response.
+7. Hit the same /preflight with detail=minimal. Verify the response is filtered but the underlying data came from cache.
+8. Verify existing tests pass: npm test
+
+What Not To Do
+  - Do NOT modify lib/scoring-engine/index.js. It is encrypted and proprietary.
+  - Do NOT modify lib/scoring.js unless adding the meta field requires it (it shouldn't).
+  - Do NOT change any endpoint request/response schemas. Only add meta.cache_hit field.
+  - Do NOT add new npm dependencies. All caching uses the existing Upstash Redis client.
+  - Do NOT read .env files or touch API keys.
+  - Do NOT change how the payment middleware works.
+  - Do NOT cache individual sub-calls within scoreProtocol (like audit data, exploit history, TVL). The endpoint-level caching at /verify/protocol already wraps scoreProtocol via cachedCall. Adding contract metadata caching is the exception because it has a MUCH longer valid TTL (24h vs 10min).
+
+Build Sequence
+  1. Read server.js lines 178-214 (CACHE_TTL and cachedCall) to understand existing cache infrastructure.
+  2. Read loadProtocolRegistry() (line 227) in full to understand exact field mapping.
+  3. Read getContractMetadata() (line 446) and scoreProtocol() (line 968) to understand the call chain.
+  4. Implement Build 1 (contract metadata cache) — smallest change, highest API savings.
+  5. Implement Build 3 (registry refresh) — independent of caching changes.
+  6. Implement Build 2 (preflight cache) — most complex, do last.
+  7. Run tests (npm test) and fix any failures.
+  8. Manual test with npm run dev and verify cache behavior per the testing checklist.
+
+Cost Constraints
+  - $0 additional cost. All changes use existing Redis (Upstash free tier) and existing DeFiLlama API (free).
+  - The 24h registry refresh adds 1 DeFiLlama call/day. Currently: 1 call per server restart. Negligible impact.
+
+EXPECTED OUTCOME: After these changes, a second /preflight call for the same inputs should return in <50ms instead of 3-8 seconds. Contract metadata for previously-seen addresses should never re-query Etherscan within 24 hours. The protocol registry should stay fresh without requiring server restarts.

@@ -1,0 +1,424 @@
+
+CLAUDE CODE ENGINEERING BRIEF
+Phase 3: Monitoring Webhooks + Compliance Audit Trail
+Date: April 2, 2026
+For: Claude Code execution
+From: Opus strategy session (Cowork)
+
+HARD CONSTRAINT: Do NOT read .env files. Do NOT read, copy, move, or log API keys. The existing code loads keys from environment variables at runtime — your code uses process.env references, never the keys directly. This applies to all models and tools.
+
+Pre-Requisite: Phase 0 (caching), Phase 1 (EAS attestations), and Phase 2 (reputation) must be complete before starting Phase 3.
+
+Mission
+Add two capabilities that Sentinel currently lacks: (1) proactive monitoring via webhooks so agents are notified when a verified target's risk profile changes, and (2) a structured compliance audit trail that records every verification with enough detail for regulatory review. Together these shift Sentinel from a purely reactive "ask and receive" service to one that actively protects its users and maintains auditable records.
+
+Strategic Context: Anti-Overfit Guardrails
+Monitoring passes the net load test:
+  - REPLACES: Agent-side polling. Without webhooks, agents must repeatedly call /preflight to detect changes. Webhooks replace N polling calls with 1 push notification.
+  - REDUCES: Total API load. One background check per target per interval replaces many redundant agent-initiated checks.
+  - RISK: Monitoring is the first BACKGROUND PATH feature — it runs on a schedule, consuming Etherscan/DeFiLlama/GoPlus calls even when no agent is actively querying. Cap the monitored address set to prevent runaway costs.
+
+Compliance audit trail passes because:
+  - It adds NO new API calls (writes to Postgres from data already computed)
+  - It ENABLES future value: regulatory compliance, dispute resolution, insurance underwriting
+
+Architecture
+
+BACKGROUND PATH (periodic, minutes-to-hours):
+  - Monitoring: Re-score watched addresses on a schedule, compare to baseline, fire webhooks on change
+
+POST-RESPONSE PATH (async, after response):
+  - Audit log: Write structured verification record to Postgres after every paid response
+
+Neither touches the hot path. No latency impact on verification endpoints.
+
+What Already Exists (After Phases 0-2)
+  - Redis for caching + agent profiles (Phase 0+2)
+  - EAS attestations recording every verification (Phase 1)
+  - Agent reputation tiers (Phase 2)
+  - Postgres via lib/db.js (pool management, migrations, query helpers)
+  - All 5 verification endpoints producing scores, verdicts, and grades
+  - Background task pattern: setInterval for protocol registry refresh (Phase 0)
+
+Build 1: Monitoring Watchlist (lib/monitoring/watchlist.js)
+
+Agents can subscribe to be notified when a target's risk changes.
+
+Data model (Redis):
+  Key: sentinel:watch:{targetAddress}:{chain}
+  Value (JSON):
+  {
+    target: "0x...",
+    chain: "base",
+    subscribers: [
+      {
+        wallet: "0x...",         // Agent wallet (used as subscriber ID)
+        webhook_url: "https://...", // Where to send notifications
+        subscribed_at: "2026-04-02T...",
+        endpoint_type: "protocol",  // What type of check to monitor
+      }
+    ],
+    baseline: {                  // Last known verification result
+      trust_score: 87,
+      verdict: "SAFE",
+      trust_grade: "B+",
+      risk_flags: ["LOW_TVL"],
+      checked_at: "2026-04-02T...",
+    },
+    last_checked: "2026-04-02T...",
+    check_interval_hours: 6,     // How often to re-check (default: 6h)
+  }
+
+TTL: 30 days (Redis EXPIRE). Watchlist entries auto-expire if not renewed. This prevents unbounded growth.
+
+Exports:
+  - addWatch(target, chain, subscriberWallet, webhookUrl, endpointType) — Add a subscriber
+  - removeWatch(target, chain, subscriberWallet) — Remove a subscriber
+  - getWatchlist() — Get all active watched addresses (for the background scanner)
+  - getWatchesForTarget(target, chain) — Get all subscribers for a specific target
+  - updateBaseline(target, chain, newBaseline) — Update the stored baseline after a re-check
+  - renewWatch(target, chain, subscriberWallet) — Reset the 30-day TTL
+
+Limits:
+  - Max 100 watched addresses total (across all agents). This caps background API consumption.
+  - Max 10 watches per agent wallet. Prevents a single agent from hogging the watchlist.
+  - Only RECOGNIZED or TRUSTED agents can create watches (unknown agents must build reputation first). Return HTTP 403 with message: "Watch subscriptions require RECOGNIZED or TRUSTED agent tier. Complete 5+ paid verifications to qualify." Include the agent's current tier and verification count in the error response so they know how close they are.
+
+Build 2: Background Scanner (lib/monitoring/scanner.js)
+
+A periodic background process that re-scores watched addresses and detects changes.
+
+Exports:
+  - startScanner() — Begin the periodic scan loop
+  - stopScanner() — Stop the loop (for graceful shutdown)
+  - scanOnce() — Run a single scan cycle (useful for testing)
+
+scanOnce() logic:
+  1. Load all active watchlist entries via getWatchlist()
+  2. Group by check_interval_hours, filter to only entries due for a check
+  3. For each due entry:
+     a. Run the appropriate scoring function (scoreProtocol, scoreCounterparty, etc.)
+     b. Compare result to stored baseline
+     c. If significant change detected → fire webhooks to all subscribers
+     d. Update the baseline with new result
+     e. Update last_checked timestamp
+  4. Log summary: addresses_scanned, changes_detected, webhooks_fired
+
+Change detection logic:
+  A "significant change" is any of:
+  - Verdict changed (e.g., SAFE → CAUTION)
+  - Trust score changed by more than 15 points
+  - New CRITICAL risk flag appeared (SANCTIONED, EXPLOIT_VICTIM, HONEYPOT)
+  - Trust grade dropped by 2+ levels (e.g., B+ → C)
+
+  function detectChange(baseline, current) {
+    const changes = [];
+    if (baseline.verdict !== current.verdict) {
+      changes.push({ type: "verdict_change", from: baseline.verdict, to: current.verdict });
+    }
+    if (Math.abs(baseline.trust_score - current.trust_score) > 15) {
+      changes.push({ type: "score_shift", from: baseline.trust_score, to: current.trust_score, delta: current.trust_score - baseline.trust_score });
+    }
+    const criticalFlags = ["SANCTIONED", "EXPLOIT_VICTIM", "HONEYPOT", "RUG_PULL"];
+    const newCritical = (current.risk_flags || []).filter(f => criticalFlags.includes(f) && !(baseline.risk_flags || []).includes(f));
+    if (newCritical.length > 0) {
+      changes.push({ type: "critical_flag", flags: newCritical });
+    }
+    return changes.length > 0 ? changes : null;
+  }
+
+Webhook notification format:
+  POST to subscriber's webhook_url with JSON body:
+  {
+    event: "risk_change",
+    target: "0x...",
+    chain: "base",
+    changes: [
+      { type: "verdict_change", from: "SAFE", to: "CAUTION" }
+    ],
+    current: {
+      trust_score: 62,
+      verdict: "CAUTION",
+      trust_grade: "C",
+      risk_flags: ["EXPLOIT_VICTIM", "TVL_DROP"],
+    },
+    previous: {
+      trust_score: 87,
+      verdict: "SAFE",
+      trust_grade: "B+",
+      risk_flags: ["LOW_TVL"],
+    },
+    checked_at: "2026-04-02T14:30:00Z",
+    sentinel_version: VERSION,
+  }
+
+Webhook delivery:
+  - Use axios.post with 5-second timeout
+  - If delivery fails, retry once after 30 seconds
+  - If retry fails, log the failure and move on. Do NOT implement a complex retry queue yet.
+  - Log all webhook deliveries (success and failure) for audit purposes
+
+Scanner schedule:
+  - Run scanOnce() every 30 minutes via setInterval
+  - Each run only processes entries where (now - last_checked) >= check_interval_hours
+  - Default check_interval_hours = 6, so most addresses are re-checked ~4 times/day
+  - With max 100 addresses, that's ~400 scoring calls/day — manageable within free API tiers
+
+Cost control:
+  - 400 scoring calls/day × ~8 API sub-calls = ~3,200 external API calls/day for monitoring
+  - This is within free tier limits for Etherscan (5 calls/sec), DeFiLlama (unlimited), GoPlus (reasonable limits)
+  - If the watchlist grows toward the 100 cap, log a warning and suggest increasing check_interval_hours
+
+Build 3: Watch Management Endpoints (New)
+
+Add three new endpoints for agents to manage their watchlist subscriptions:
+
+POST /watch — Subscribe to monitoring
+  - Requires x402 payment (pricing: $0.05/month equivalent — implement as a one-time fee that activates a 30-day watch)
+  - Body: { target: "0x...", chain: "base", webhook_url: "https://...", endpoint_type: "protocol" }
+  - Validation:
+    - target must be valid 0x address
+    - webhook_url must be valid HTTPS URL (no HTTP)
+    - endpoint_type must be one of: "protocol", "token", "counterparty"
+    - Agent must be RECOGNIZED or TRUSTED tier
+  - Response: { watch_id: "{target}:{chain}", subscribed: true, expires_at: "2026-05-02T...", check_interval_hours: 6 }
+  - Creates the watchlist entry if none exists, or adds the agent as a subscriber if entry exists
+
+DELETE /watch — Unsubscribe from monitoring
+  - Free (no payment required)
+  - Body: { target: "0x...", chain: "base" }
+  - Removes the agent from the subscriber list
+  - If no subscribers remain, remove the watchlist entry entirely
+
+GET /watch — List active watches
+  - Free
+  - Returns all active watches for the calling agent's wallet
+  - Response: { watches: [{ target, chain, endpoint_type, subscribed_at, expires_at, last_checked, baseline }] }
+
+Build 4: Compliance Audit Trail (lib/compliance/audit-log.js)
+
+Every paid verification gets a structured audit record in Postgres. This is the raw material for regulatory compliance, dispute resolution, and analytics.
+
+Database migration (add to lib/db.js migration system):
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id SERIAL PRIMARY KEY,
+    request_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Caller identity
+    agent_wallet TEXT,
+    agent_tier TEXT DEFAULT 'unknown',
+    ip_address TEXT,
+
+    -- Request
+    endpoint TEXT NOT NULL,          -- 'protocol', 'token', 'counterparty', 'position', 'preflight'
+    target_address TEXT NOT NULL,
+    chain TEXT DEFAULT 'base',
+    request_params JSONB,            -- Full request parameters (sanitized)
+
+    -- Result
+    verdict TEXT NOT NULL,
+    trust_score NUMERIC(5,2),
+    trust_grade TEXT,
+    risk_flags TEXT[],
+    proceed BOOLEAN,
+
+    -- Performance
+    response_time_ms INTEGER,
+    cache_hit BOOLEAN DEFAULT FALSE,
+    attestation_uid TEXT,            -- EAS attestation UID if written
+
+    -- Payment
+    x402_payment_amount TEXT,        -- e.g., "$0.008"
+    x402_payment_verified BOOLEAN,
+
+    -- Data quality
+    data_sources_used TEXT[],        -- Which APIs contributed data
+    degraded_sources TEXT[],         -- Which sources failed/degraded
+
+    -- Indexing
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp);
+  CREATE INDEX idx_audit_log_agent ON audit_log(agent_wallet);
+  CREATE INDEX idx_audit_log_target ON audit_log(target_address);
+  CREATE INDEX idx_audit_log_verdict ON audit_log(verdict);
+
+Exports:
+  - writeAuditLog(entry) — Insert a single audit record (fire-and-forget, non-blocking)
+  - getAuditHistory(filters) — Query audit records with filters (for admin/compliance)
+
+writeAuditLog implementation:
+  - Takes a structured object matching the table columns
+  - Uses the existing db pool from lib/db.js
+  - MUST be non-blocking — the caller fires and forgets. Errors are logged but never thrown.
+  - Sanitize request_params: Remove any auth headers, payment tokens, or other sensitive data before storing
+
+getAuditHistory implementation:
+  - Supports filters: agent_wallet, target_address, date_range, verdict, endpoint
+  - Returns paginated results (limit + offset)
+  - This is for admin use only — not exposed via public API yet
+
+Build 5: Audit Log Integration into server.js
+
+After each paid endpoint sends its response, write an audit record:
+
+  // Fire-and-forget audit log (post-response path)
+  writeAuditLog({
+    agent_wallet: payerWallet,
+    agent_tier: tier,
+    ip_address: req.ip,
+    endpoint: "protocol",   // varies by endpoint
+    target_address: address,
+    chain,
+    request_params: { /* sanitized params */ },
+    verdict: result.verdict,
+    trust_score: result.trust_score,
+    trust_grade: result.trust_grade,
+    risk_flags: result.risk_flags || [],
+    proceed: result.verdict !== "UNSAFE",
+    response_time_ms: Date.now() - startTime,
+    cache_hit: result.meta?.cache_hit || false,
+    attestation_uid: null,  // Set by attestation write callback if available. Cross-references EAS attestation from Phase 1. When createVerificationAttestation() returns the UID, pass it here. If attestation write is fire-and-forget, update the audit record async: UPDATE audit_log SET attestation_uid = $1 WHERE request_id = $2
+    x402_payment_amount: PRICE.verifyProtocol,  // varies by endpoint
+    x402_payment_verified: true,
+    data_sources_used: ["etherscan", "defilama", "alchemy"],  // varies
+    degraded_sources: result.risk_flags?.includes("OFAC_SCREENING_UNAVAILABLE") ? ["ofac"] : [],
+  }).catch(err => logger.error({ err }, "Audit log write failed"));
+
+Apply this pattern to all 5 paid endpoints. Adjust the endpoint name, price, and data_sources_used for each.
+
+Build 6: Admin Compliance Endpoint (New)
+
+Add an admin-only endpoint for querying the audit trail:
+
+GET /admin/audit
+  - Protected by SENTINEL_ADMIN_KEY (same auth as existing /admin routes)
+  - Query parameters:
+    - agent: Filter by agent wallet
+    - target: Filter by target address
+    - verdict: Filter by verdict (SAFE, CAUTION, UNSAFE)
+    - from: Start date (ISO)
+    - to: End date (ISO)
+    - limit: Results per page (default 50, max 200)
+    - offset: Pagination offset
+  - Response:
+    {
+      records: [ /* audit records */ ],
+      total: 142,
+      filters_applied: { ... },
+      meta: { sentinel_version: VERSION }
+    }
+
+GET /admin/audit/summary
+  - Protected by SENTINEL_ADMIN_KEY
+  - Returns aggregate stats:
+    {
+      total_verifications: 1420,
+      period: "30d",
+      by_verdict: { SAFE: 980, CAUTION: 350, UNSAFE: 90 },
+      by_endpoint: { protocol: 500, preflight: 400, token: 250, counterparty: 200, position: 70 },
+      by_tier: { unknown: 800, recognized: 450, trusted: 170 },
+      avg_response_time_ms: 1240,
+      cache_hit_rate: 0.42,
+      unique_agents: 23,
+      unique_targets: 156,
+      degraded_percentage: 0.08,
+    }
+
+Build 7: Monitoring Report Generation (Background)
+
+Add a periodic report generator that produces a daily summary. This runs on the BACKGROUND PATH.
+
+  - Runs once per day (setInterval, 24h)
+  - Queries the audit_log for the past 24 hours
+  - Computes summary statistics (same as /admin/audit/summary but for the 24h window)
+  - Logs the summary to the structured log (pino)
+  - Optionally writes to a Postgres table `daily_reports` for historical tracking
+
+  CREATE TABLE IF NOT EXISTS daily_reports (
+    id SERIAL PRIMARY KEY,
+    report_date DATE NOT NULL UNIQUE,
+    total_verifications INTEGER,
+    verdicts_json JSONB,
+    endpoints_json JSONB,
+    tiers_json JSONB,
+    avg_response_ms INTEGER,
+    cache_hit_rate NUMERIC(4,3),
+    unique_agents INTEGER,
+    unique_targets INTEGER,
+    monitoring_changes INTEGER,      -- Number of risk changes detected
+    webhooks_fired INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  This is lightweight — one row per day, no complex joins.
+
+Expected File Structure
+
+New files:
+  lib/monitoring/watchlist.js    — Watchlist CRUD (Redis-backed)
+  lib/monitoring/scanner.js      — Background scanner + webhook delivery
+  lib/monitoring/README.md       — Monitoring documentation
+  lib/compliance/audit-log.js    — Audit trail write/query (Postgres-backed)
+  lib/compliance/README.md       — Compliance documentation
+
+Modified files:
+  server.js                      — Import modules, start scanner, watch endpoints, audit writes, admin endpoints
+  lib/db.js                      — Add migration for audit_log and daily_reports tables
+  package.json                   — Add monitoring price to x402 config if needed
+
+New environment variables (document in .env.example):
+  None. All infrastructure (Redis, Postgres, Alchemy) is already configured.
+
+No new npm dependencies. Uses existing axios (webhooks), pg (audit log), Redis (watchlist).
+
+Testing Checklist
+  1. Run database migration. Verify audit_log and daily_reports tables exist.
+  2. Start the server. Verify scanner starts with "0 addresses to scan" log.
+  3. Hit /verify/protocol. Verify an audit_log record is written (check via /admin/audit).
+  4. POST /watch to subscribe to a target. Verify watchlist entry in Redis.
+  5. Wait for or trigger a scan cycle. Verify the watched address is re-scored.
+  6. Manually change a target's conditions (if possible) or mock a score change. Verify webhook fires.
+  7. GET /watch to see active watches.
+  8. DELETE /watch to unsubscribe. Verify removal.
+  9. GET /admin/audit — verify records appear with correct data.
+  10. GET /admin/audit/summary — verify aggregate stats compute correctly.
+  11. Run npm test — all existing tests pass.
+  12. Verify scanner respects the 100-address cap.
+  13. Verify only RECOGNIZED/TRUSTED agents can POST /watch (unknown agents get 403).
+
+What Not To Do
+  - Do NOT put monitoring on the hot path. Scanner runs in background only.
+  - Do NOT implement complex webhook retry queues. One retry is sufficient for now.
+  - Do NOT store raw request headers or auth tokens in the audit log. Sanitize everything.
+  - Do NOT allow unlimited watchlist growth. Enforce the 100-address cap strictly.
+  - Do NOT make the audit trail a dependency for endpoint responses. If Postgres write fails, the verification still succeeds.
+  - Do NOT modify lib/scoring-engine/index.js.
+  - Do NOT read .env files or log keys.
+  - Do NOT add new npm dependencies.
+  - Do NOT implement email notifications or SMS. Webhooks only for now.
+
+Build Sequence
+  1. Add database migration for audit_log and daily_reports tables to lib/db.js.
+  2. Create lib/compliance/audit-log.js with writeAuditLog() and getAuditHistory().
+  3. Integrate audit log writes into all 5 paid endpoints in server.js.
+  4. Add /admin/audit and /admin/audit/summary endpoints.
+  5. Create lib/monitoring/watchlist.js with all CRUD operations.
+  6. Create lib/monitoring/scanner.js with scanOnce() and startScanner().
+  7. Add POST /watch, DELETE /watch, GET /watch endpoints to server.js.
+  8. Start the scanner in the app.listen() block.
+  9. Test the full flow: subscribe → scan → detect change → fire webhook.
+  10. Add the daily report generator.
+  11. Run npm test and verify no regressions.
+  12. Load test: verify scanner stays within API rate limits with 100 watched addresses.
+
+Cost Constraints
+  - Monitoring: ~3,200 API calls/day at max capacity (100 addresses × 4 checks × 8 sub-calls). Within free tier limits for all providers.
+  - Audit log: Postgres writes only. No additional API costs.
+  - Webhooks: Outbound HTTP calls to agent endpoints. Negligible cost.
+  - Daily reports: 1 Postgres query/day. Negligible.
+
+EXPECTED OUTCOME: After this phase, Sentinel actively monitors verified targets and pushes risk change notifications to subscribed agents. The audit trail provides a complete, queryable record of every verification — ready for compliance review, analytics, and future insurance/regulatory requirements. Combined with Phase 0's caching, Phase 1's attestations, and Phase 2's reputation, Sentinel is now a full trust infrastructure platform, not just a verification API.

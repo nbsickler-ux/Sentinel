@@ -1,0 +1,320 @@
+
+CLAUDE CODE ENGINEERING BRIEF
+Phase 1: EAS Attestation Layer on Base
+Date: April 2, 2026
+For: Claude Code execution
+From: Opus strategy session (Cowork)
+
+HARD CONSTRAINT: Do NOT read .env files. Do NOT read, copy, move, or log API keys. The existing code loads keys from environment variables at runtime — your code uses process.env references, never the keys directly. This applies to all models and tools. Violation of this rule requires explicit user permission in that moment.
+
+Mission
+Add an Ethereum Attestation Service (EAS) layer to Sentinel so that every verification result is recorded as an on-chain attestation on Base. This creates a permanent, queryable trust record: when an agent asks "has this contract been checked before?", Sentinel can read existing attestations instead of re-running all API calls. Attestations replace Redis as the source of truth for cross-agent queries while Redis remains the hot-path cache for same-session speed.
+
+This is the single biggest architectural upgrade to Sentinel — it transforms results from ephemeral API responses into persistent, verifiable trust artifacts that any agent (not just the original requester) can consume.
+
+Strategic Context: Anti-Overfit Guardrails
+Every new layer must pass the "net load test": does it REDUCE calls, REPLACE a source, or create a new single point of failure?
+
+EAS attestations pass:
+  - REDUCE: Returning agents can read an existing attestation instead of paying for a full re-verification
+  - REPLACE: For cross-agent queries, attestations replace what would be a fresh API call chain
+  - SPOF: EAS is on-chain (Base L1) — it cannot go down independently of Base itself
+
+EAS does NOT go on the hot path for writes. Architecture:
+  - HOT PATH (reads, <5s): Read existing attestations from EAS GraphQL
+  - POST-RESPONSE PATH (async, after response sent): Write new attestation to EAS on-chain
+  - BACKGROUND PATH: Periodic cleanup/indexing if needed later (Phase 3)
+
+What Is EAS
+Ethereum Attestation Service (EAS) is a public good on Base (and Ethereum) that lets anyone create structured on-chain attestations. Key concepts:
+  - Schema: A registered data structure (like a database table definition). Created once, referenced by UID.
+  - Attestation: An instance of a schema with filled-in data. Created on-chain, indexed by EAS.
+  - SchemaRegistry contract (Base mainnet): 0xA7b39296258348C78294F95B872b282326A97BDF
+  - EAS contract (Base mainnet): 0x4200000000000000000000000000000000000021
+  - GraphQL endpoint (Base mainnet): https://base.easscan.org/graphql
+
+These are the official Base mainnet addresses. Verify them at https://docs.attest.org/docs/quick--start/contracts before deploying.
+
+What Already Exists
+  - server.js has 5 verification endpoints that produce trust scores, verdicts, and grades
+  - Redis caching (cachedCall) provides hot-path speed for repeated queries
+  - x402 payment middleware handles micropayments per request
+  - The wallet used for x402 (WALLET_ADDRESS env var) can also sign EAS attestations
+  - ethers.js is NOT currently a dependency. You will need to add it.
+
+Pre-Requisite: Phase 0 must be complete before starting Phase 1. The contract metadata cache and preflight cache should already be in place.
+
+Build 1: EAS Schema Registration (One-Time Setup Script)
+
+Create a one-time deployment script at lib/eas/deploy-schema.js that registers the Sentinel verification schema on Base mainnet.
+
+Schema Design
+The schema encodes the essential fields from a Sentinel verification result. Keep it lean — attestation data costs gas.
+
+Schema string (EAS format — comma-separated field declarations):
+  "address target, string chain, string endpointType, uint8 trustScore, string verdict, string trustGrade, bool proceed, string riskFlags, uint64 timestamp, uint256 x402PaymentId"
+
+Field rationale:
+  - target (address): The contract/token/counterparty that was verified
+  - chain (string): "base" or "base-sepolia"
+  - endpointType (string): "protocol", "token", "counterparty", "position", "preflight"
+  - trustScore (uint8): 0-100 score (fits in uint8, saves gas vs uint256)
+  - verdict (string): "SAFE", "CAUTION", "UNSAFE", "UNKNOWN"
+  - trustGrade (string): "A+", "A", "B", etc.
+  - proceed (bool): Whether Sentinel recommends proceeding
+  - riskFlags (string): Comma-separated risk flags (e.g., "UNVERIFIED_SOURCE,LOW_TVL")
+  - timestamp (uint64): Unix timestamp of the verification
+  - x402PaymentId (uint256): Payment reference from x402 (0 if test/free call)
+
+Dependencies to add:
+  npm install ethers @ethereum-attestation-service/eas-sdk
+
+Deploy script (lib/eas/deploy-schema.js):
+  - Read WALLET_ADDRESS and a WALLET_PRIVATE_KEY from environment (the private key is needed to sign the schema registration transaction)
+  - Connect to Base mainnet via Alchemy RPC: https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+  - Use SchemaRegistry from @ethereum-attestation-service/eas-sdk
+  - Register the schema with resolver = 0x0000000000000000000000000000000000000000 (no resolver — we handle validation in our code)
+  - revocable = true (we may need to revoke bad attestations)
+  - Log the schema UID after registration
+  - Save the schema UID to a config file: lib/eas/config.js exporting { SCHEMA_UID, EAS_CONTRACT, SCHEMA_REGISTRY }
+
+IMPORTANT: This script runs ONCE manually by the developer (Nate). It is NOT run in production. It requires a private key, which is never stored in code. The script should prompt for or read the private key from an environment variable SENTINEL_DEPLOYER_KEY.
+
+After running, the output schema UID gets hardcoded into lib/eas/config.js.
+
+Build 2: EAS Client Module (lib/eas/client.js)
+
+Create a reusable EAS client module that handles both reading and writing attestations.
+
+Exports:
+  - initEAS() — Initialize the EAS SDK with a provider and signer
+  - createVerificationAttestation(data) — Write an attestation (post-response path)
+  - getExistingAttestation(target, chain, endpointType) — Read attestation (hot path)
+  - getAttestationsByTarget(target) — Get all attestations for a target address
+
+Implementation details:
+
+initEAS():
+  - Create an ethers.js provider connected to Base mainnet via Alchemy
+  - Create a signer from SENTINEL_ATTESTATION_KEY env var (this is a dedicated key for attestation signing, separate from the x402 wallet — use the same key if they are the same, but the env var name should be distinct for clarity)
+  - Initialize the EAS SDK: new EAS(EAS_CONTRACT_ADDRESS)
+  - Connect the signer: eas.connect(signer)
+  - Store as module-level singleton
+  - Fail gracefully if SENTINEL_ATTESTATION_KEY is not set — log a warning and disable attestation writes. Reads (via GraphQL) should still work without a signer.
+
+createVerificationAttestation(data):
+  - Takes: { target, chain, endpointType, trustScore, verdict, trustGrade, proceed, riskFlags, timestamp, x402PaymentId }
+  - Encodes the data according to the schema using SchemaEncoder from eas-sdk
+  - Calls eas.attest() with:
+      schema: SCHEMA_UID (from config)
+      data: { recipient: target, expirationTime: 0 (no expiration), revocable: true, data: encodedData }
+  - Returns the attestation UID
+  - MUST be non-blocking from the caller's perspective — the caller fires and forgets. Errors are logged but never thrown to the caller.
+  - Gas: Base L2 gas is cheap (~$0.001-$0.01 per attestation). Use ethers to estimate gas and log cost.
+
+getExistingAttestation(target, chain, endpointType):
+  - Uses GraphQL query to EAS (NOT on-chain call — GraphQL is faster)
+  - Query: Find the most recent attestation matching:
+      attester = SENTINEL_WALLET_ADDRESS
+      schema = SCHEMA_UID
+      recipient = target
+      AND decoded data contains chain + endpointType match
+  - Filter: Only return attestations less than 24 hours old (for protocol/counterparty) or 1 hour (for token)
+  - Returns the decoded attestation data, or null if no valid attestation exists
+  - This is the HOT PATH read — must be fast. Set a 2-second timeout on the GraphQL query. If it times out, return null (fall through to fresh computation).
+
+  GraphQL endpoint: https://base.easscan.org/graphql
+  Example query structure:
+    query GetAttestations($where: AttestationWhereInput) {
+      attestations(where: $where, orderBy: { time: desc }, take: 1) {
+        id
+        attester
+        recipient
+        time
+        decodedDataJson
+      }
+    }
+
+getAttestationsByTarget(target):
+  - Returns all Sentinel attestations for a given target address
+  - Useful for agents that want to see the full verification history
+  - Same GraphQL approach, no time filter, limit to 50 most recent
+
+Build 3: Integration into Verification Endpoints
+
+Integrate EAS into the existing verification flow with two touch points: read (pre-computation) and write (post-response).
+
+HOT PATH — Read Before Compute
+For each paid endpoint (/verify/protocol, /verify/token, /verify/counterparty, /preflight), add an attestation lookup BEFORE the Redis cache check. The flow becomes:
+
+  1. Check EAS attestation (2s timeout, GraphQL) — if valid attestation exists AND is within freshness window, return it with meta.source = "attestation"
+  2. Check Redis cache — existing behavior
+  3. Compute fresh — existing behavior
+  4. Fire-and-forget attestation write — new (post-response path)
+
+IMPORTANT DECISION: The EAS attestation read should be INSIDE the existing cachedCall() pattern, not outside it. Here's why: if Redis has the result, that's faster than a GraphQL query to EAS. The attestation read matters when:
+  a) Redis cache has expired (past TTL) but a recent attestation exists
+  b) A DIFFERENT agent previously queried the same target (Redis is per-session, attestations are global)
+
+So the actual flow is:
+  1. Redis cache check (existing cachedCall) — if hit, skip to step 4
+  2. EAS attestation check — if valid, use it, populate Redis cache, skip to step 4
+  3. Full computation — existing behavior
+  4. Return result
+  5. Post-response: write attestation (fire and forget)
+
+Implementation in server.js:
+
+For /verify/protocol (line 1337):
+  After the existing cachedCall wrapper, check if the result came from cache or computation. If from computation (meta.cache_hit === false), fire the attestation write.
+
+  Actually, cleaner approach: Add the attestation layer into the cachedCall's computeFn. Create a helper:
+
+  async function computeWithAttestation(cacheKey, ttl, endpointType, target, chain, computeFn) {
+    return cachedCall(cacheKey, ttl, async () => {
+      // Try attestation first
+      const attestation = await getExistingAttestation(target, chain, endpointType).catch(() => null);
+      if (attestation && attestation.trustScore !== undefined) {
+        logger.info({ target, chain, endpointType, attestationAge: Date.now() - attestation.timestamp * 1000 }, "Using existing EAS attestation");
+        return { ...attestation, meta: { source: "attestation", cache_hit: false } };
+      }
+      // No attestation — full compute
+      return computeFn();
+    });
+  }
+
+  Wait — this won't work cleanly because the attestation format differs from the full response format. The attestation stores summary fields (score, verdict, grade) but not the full evidence/details object.
+
+  REVISED APPROACH: Attestations are NOT a replacement for the full response. They are a SUPPLEMENT. Use attestations for two purposes:
+  1. A fast "has this been checked recently?" signal for agents (exposed via a new lightweight endpoint)
+  2. A persistent receipt that the verification happened (audit trail)
+
+  For the hot path integration, keep it simple:
+
+  POST-RESPONSE WRITE ONLY (for now). In each paid endpoint handler, after sending the response:
+
+  // Fire-and-forget attestation write (non-blocking)
+  if (easEnabled) {
+    createVerificationAttestation({
+      target: address,
+      chain,
+      endpointType: "protocol",
+      trustScore: Math.round(result.trust_score * 100),
+      verdict: result.verdict,
+      trustGrade: result.trust_grade,
+      proceed: result.verdict !== "UNSAFE",
+      riskFlags: (result.risk_flags || []).join(","),
+      timestamp: Math.floor(Date.now() / 1000),
+      x402PaymentId: 0, // TODO: Extract from x402 payment receipt when available
+    }).catch(err => logger.error({ err, target: address }, "Attestation write failed"));
+  }
+
+  The `easEnabled` flag is true when initEAS() succeeded (signer available).
+
+  Apply this pattern to all 5 endpoints:
+  - /verify/protocol (endpointType: "protocol")
+  - /verify/token (endpointType: "token")
+  - /verify/counterparty (endpointType: "counterparty")
+  - /verify/position (endpointType: "position")
+  - /preflight (endpointType: "preflight")
+
+Build 4: Attestation Lookup Endpoint (New)
+
+Add a new FREE (no x402 payment) endpoint:
+
+GET /attestation/:address
+  - Returns the most recent Sentinel attestations for the given address
+  - Query parameters: chain (default "base"), type (optional — filter by endpointType)
+  - Response:
+    {
+      address: "0x...",
+      attestations: [
+        {
+          uid: "0x...",
+          endpointType: "protocol",
+          trustScore: 87,
+          verdict: "SAFE",
+          trustGrade: "B+",
+          timestamp: "2026-04-02T...",
+          age_hours: 2.5,
+        }
+      ],
+      count: 1,
+      meta: { sentinel_version: VERSION }
+    }
+  - This endpoint is lightweight (GraphQL read only) and free — it encourages agents to check existing attestations before paying for a fresh verification.
+  - Rate limit it separately: 50 calls per IP per hour (use the existing ratelimit infrastructure or a simple in-memory counter).
+
+Build 5: x402 Receipt Binding (Preparation)
+
+The x402 ecosystem has an active PR (#935 on coinbase/x402) for Signed Receipts. When this ships, each x402 payment will produce a cryptographic receipt that can be bound to the attestation.
+
+For now, prepare the plumbing:
+  - The schema includes x402PaymentId (uint256) — currently set to 0
+  - Add a comment in the attestation write code: // TODO: When x402 Signed Receipts ship (PR #935), extract receipt ID from payment middleware and bind here
+  - In the /preflight response, add a new field to meta:
+    attestation_enabled: easEnabled,
+  - This signals to agents that Sentinel produces attestations, even before they can query them.
+
+Expected File Structure
+
+New files:
+  lib/eas/config.js            — Schema UID, contract addresses, constants
+  lib/eas/client.js            — EAS read/write client module
+  lib/eas/deploy-schema.js     — One-time schema deployment script (not for production)
+  lib/eas/README.md            — Brief documentation on the EAS integration
+
+Modified files:
+  server.js                    — Import EAS client, init at startup, post-response writes, new /attestation endpoint
+  package.json                 — Add ethers + @ethereum-attestation-service/eas-sdk
+
+New environment variables (to document in .env.example):
+  SENTINEL_ATTESTATION_KEY     — Private key for signing attestations (can be same as WALLET_ADDRESS key)
+
+Dependency Additions
+  npm install ethers@^6.13 @ethereum-attestation-service/eas-sdk
+
+  ethers is the standard Ethereum library. EAS SDK is the official attestation toolkit.
+  Both are well-maintained, widely used, and add no security concerns.
+
+Gas Budget
+  - Each attestation on Base costs approximately $0.001-$0.01 in ETH gas
+  - At 100 verifications/day = $0.10-$1.00/day in gas costs
+  - The SENTINEL_ATTESTATION_KEY wallet needs a small ETH balance on Base for gas
+  - If the wallet runs out of gas, attestation writes fail silently (logged) and verifications continue normally
+  - Add a gas balance check in initEAS() — warn if balance < 0.01 ETH
+
+Testing Checklist
+  1. Run the schema deployment script on Base Sepolia first (testnet). Verify schema appears on https://sepolia.easscan.org
+  2. Write a test attestation on Sepolia. Verify it appears on easscan.
+  3. Read the test attestation via GraphQL. Verify decoded data matches.
+  4. Switch to Base mainnet. Deploy schema. Record the UID in config.js.
+  5. Start the server. Verify initEAS() logs success (or graceful warning if key not set).
+  6. Hit /verify/protocol for a known address. Verify attestation is written (check easscan after ~5 seconds).
+  7. Hit GET /attestation/:address for the same address. Verify the attestation appears.
+  8. Verify all existing endpoints still work with correct response schemas.
+  9. Verify that if SENTINEL_ATTESTATION_KEY is not set, the server starts normally with attestations disabled.
+  10. Run npm test — all existing tests pass.
+
+What Not To Do
+  - Do NOT put attestation WRITES on the hot path. Writes are always post-response.
+  - Do NOT make attestation reads a hard dependency. If EAS GraphQL is slow/down, fall through to compute.
+  - Do NOT store the full verification response in the attestation. Only store summary fields (score, verdict, grade, flags). Full details stay in the API response.
+  - Do NOT read .env files or log private keys.
+  - Do NOT modify lib/scoring-engine/index.js.
+  - Do NOT add resolver logic to the schema. Keep the schema simple and handle all validation in Sentinel's code.
+  - Do NOT block server startup if EAS initialization fails. Attestations are an enhancement, not a requirement.
+
+Build Sequence
+  1. Read the EAS documentation: https://docs.attest.org/docs/quick--start/contracts — verify Base mainnet addresses.
+  2. npm install ethers @ethereum-attestation-service/eas-sdk
+  3. Create lib/eas/config.js with contract addresses and placeholder schema UID.
+  4. Create lib/eas/deploy-schema.js — test on Base Sepolia first.
+  5. Deploy schema on Sepolia, verify on easscan, update config.js with UID.
+  6. Create lib/eas/client.js with initEAS(), createVerificationAttestation(), getExistingAttestation(), getAttestationsByTarget().
+  7. Integrate into server.js — import, init at startup, add post-response writes to all 5 endpoints.
+  8. Add GET /attestation/:address endpoint.
+  9. Test on Sepolia end-to-end.
+  10. Deploy schema on Base mainnet, update config.js, test in production.
+
+EXPECTED OUTCOME: After this phase, every Sentinel verification produces a permanent on-chain attestation on Base. Any agent can query GET /attestation/:address to see if a target has been recently verified, reducing duplicate paid calls. This positions Sentinel as the canonical trust record for the x402 ecosystem — not just a verification API, but a trust layer with provable history.

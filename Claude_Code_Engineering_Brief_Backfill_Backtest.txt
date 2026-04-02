@@ -1,0 +1,149 @@
+
+CLAUDE CODE ENGINEERING BRIEF
+Market Agent: Historical Backfill + Backtesting Harness
+Date: April 1, 2026
+For: Claude Code execution
+From: Opus strategy session (Cowork)
+  HARD CONSTRAINT: Do NOT read .env files. Do NOT read, copy, move, or log API keys. The existing config.js loads keys from .env at runtime — your code uses config.js, never the keys directly. This applies to all models (Opus, Sonnet, Haiku) and all tools. Violation of this rule requires explicit user permission in that moment.
+Mission
+Build a historical data backfill pipeline and backtesting harness for Market Agent. The goal is to eliminate the 14-day data accumulation wait by pulling months of historical data from free public APIs, then immediately start validating signals against that data. Live data collection (already shipping via migration v4) runs in parallel for forward validation.
+Success criteria: 3+ months of historical price data for all three pairs (cbBTC/USDC, ETH/USDC, AERO/USDC) loaded into the existing Postgres tables, with a working backtesting harness that can replay historical data through the signal engine and produce performance metrics.
+
+What Already Exists
+You are working in the Sentinel repository. Market Agent is at market-agent/ within that repo. Read the codebase before building — don’t assume, verify.
+Database (just shipped today)
+	•	Migration v4 in db/migrate.js creates three new tables: ingestion_snapshots, arb_observations, api_costs. These auto-apply on next server startup.
+	•	ingestion_snapshots: cycle, timestamp, points_json (JSONB), summary_json (JSONB), source_count, point_count.
+	•	arb_observations: cycle, timestamp, pair, cex_price, dex_price, spread_bps, signal_fired, signal_strength.
+	•	Query functions in db/queries.js: saveIngestionSnapshot(), saveArbObservation(), getArbHistory().
+Signal Engine (pure functions, backtesting-ready)
+	•	signals/arbitrage.js: analyze(pair, inputPrices, inputHistory, cycle) — already accepts inputPrices ({cexPrice, dexPrice}) and inputHistory for backtesting. This was designed for Phase 2 from day one.
+	•	signals/trend.js, reversion.js, volatility.js: synchronous pure functions. analyze(pair) reads from the in-memory price history module.
+	•	signals/history.js: ingestDataPoints(dataPoints) feeds the rolling price window. For backtesting, you feed historical data through this.
+	•	signals/scorer.js: computeComposite(pair, signals) with weights: trend 0.30, reversion 0.20, volatility 0.15, arbitrage 0.20, onchain 0.15.
+	•	Signal schema (signals/schema.js): createSignal({ type, pair, direction, confidence, regime, indicators, thesis }).
+Data Schema
+	•	All ingestion modules normalize to DataPoint via schema.js: createDataPoint({ source, pair, type, timestamp, data, meta }).
+	•	VALID_SOURCES: aerodrome, alchemy, coinbase, coingecko, fred, news.
+	•	VALID_TYPES: price, pool, onchain, macro, news, orderbook.
+Aerodrome Pool Addresses (hardcoded in ingest/aerodrome.js)
+	•	cbBTC/USDC: 0x4e962bb3889bf030368f56810a9c96b83cb3e778
+	•	ETH/USDC: 0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59
+	•	AERO/USDC: 0xbe00ff35af70e8415d0eb605a286d8a45466a4c1
+Config (config.js)
+	•	Loads from shared .env at project root. pairs: ["cbBTC/USDC", "ETH/USDC", "AERO/USDC"].
+	•	Anthropic model: claude-sonnet-4-20250514, maxTokens: 1000.
+	•	Available keys (DO NOT READ VALUES): ALCHEMY_API_KEY, COINBASE_ADV_API_KEY, COINGECKO_API_KEY, FRED_API_KEY, THE_GRAPH_API_KEY, DATABASE_URL, UPSTASH_REDIS_REST_URL/TOKEN.
+
+Build 1: Historical Data Backfill Pipeline
+Create a standalone script at market-agent/src/backfill/index.js (new directory). This script runs once to pull historical data and populate the database. It is not part of the live cycle — it’s a one-time data loader.
+Data Sources (all free, no new API keys needed)
+Source 1: Coinbase Public Candles (CEX prices)
+Endpoint: GET https://api.exchange.coinbase.com/products/{product_id}/candles — this is the public Exchange API, NOT the Advanced Trade API. No authentication required.
+	•	Products: BTC-USD, ETH-USD (Coinbase Exchange doesn’t list AERO directly — use CoinGecko for AERO).
+	•	Parameters: granularity (60 = 1 min, 300 = 5 min, 3600 = 1 hour), start (ISO timestamp), end (ISO timestamp).
+	•	Returns: Array of [timestamp, low, high, open, close, volume]. Max 300 candles per request.
+	•	Rate limit: 10 requests/second on public endpoints. Paginate by sliding the time window.
+	•	Target: 3 months of hourly candles minimum. 5-minute candles if feasible within rate limits.
+Source 2: CoinGecko Historical (AERO price + supplementary)
+Endpoint: GET /api/v3/coins/{id}/market_chart/range — uses the existing CoinGecko key in config.js (or works without key at reduced rate limits).
+	•	IDs: coinbase-wrapped-btc, ethereum, aerodrome-finance (already mapped in ingest/coingecko.js).
+	•	Parameters: vs_currency=usd, from (unix timestamp), to (unix timestamp).
+	•	Returns: { prices: [[timestamp, price], ...], market_caps: [...], total_volumes: [...] }.
+	•	Granularity auto-selected: 5-min within 1 day, hourly for 1–90 days, daily beyond 90 days.
+	•	Rate limit: 30 calls/min with demo key, 500ms between calls without key (already handled in ingest/coingecko.js).
+	•	Strategy: Pull 90 days of hourly data in one call per token. For older data, accept daily granularity.
+Source 3: FRED Historical (macro indicators)
+The existing fred.js ingest module already fetches with limit: 2 (latest + previous). For backfill, fetch full history.
+	•	Endpoint: Same as existing (https://api.stlouisfed.org/fred/series/observations) with higher limit.
+	•	Series: DFF, T10Y2Y, DTWEXBGS, CPIAUCSL, VIXCLS (already defined in ingest/fred.js INDICATORS constant).
+	•	Parameters: Change limit to 365 (1 year of daily). Add observation_start for date range.
+	•	Rate limit: 120 requests/minute. More than enough.
+Source 4: Aerodrome On-Chain History via Alchemy (DEX prices)
+Use Alchemy’s eth_getLogs RPC to pull historical Swap events from the Aerodrome pool contracts on Base.
+	•	RPC URL: Uses ALCHEMY_API_KEY already in config (Base mainnet).
+	•	Method: eth_getLogs with topics filter for Swap events.
+	•	Pool addresses: See the three addresses listed above.
+	•	Swap event signature varies by pool type (Aerodrome uses Solidly-style pools). Inspect the pool ABI to get the correct event topic. The Swap event typically emits: amount0In, amount1In, amount0Out, amount1Out. From these you can compute the effective swap price.
+	•	Block range: Base launched June 2023. cbBTC pools appeared ~October 2024. Query from block where pool was deployed.
+	•	Pagination: Alchemy limits getLogs responses to 10K logs per call. Paginate by block range.
+	•	Rate limit: 330 compute units/second on Growth plan. getLogs costs 75 CU per call. ~4 calls/second.
+Important: This is the most complex data source. If it proves difficult to decode swap events reliably, fall back to The Graph’s Aerodrome subgraph with historical pool day data queries. The subgraph gives daily OHLCV-equivalent data which is sufficient for initial backtesting, even if it’s not minute-level.
+Backfill Output Format
+The backfill script should write to two tables:
+	•	arb_observations: One row per historical data point where both CEX and DEX prices are available for the same timestamp (or nearest match within 5 minutes). Compute spread_bps. Set cycle = NULL (historical data has no cycle). Set signal_fired and signal_strength based on thresholds (50bps alert, 100bps strong). This is the primary backtesting dataset for the arb signal.
+	•	ingestion_snapshots: Optional for historical data. If you construct full synthetic DataPoint arrays, write them here. If the backfill only produces price series, skip this table and write directly to arb_observations. Don’t over-engineer this.
+Backfill Script Requirements
+	•	Idempotent: Running the script twice doesn’t duplicate data. Use ON CONFLICT or check for existing timestamp ranges before inserting.
+	•	Resumable: If it fails partway through (rate limit, network error), it can pick up where it left off. Track the last successfully backfilled timestamp.
+	•	Progress logging: Log source, pair, date range, and row count as it progresses. This will run for several minutes — silence is not acceptable.
+	•	Cost: $0. All sources are free tier. Do not use any paid API endpoints.
+
+Build 2: Backtesting Harness
+Create a backtesting module at market-agent/src/backtest/ (new directory). This replays historical data through the existing signal engine and measures performance.
+Architecture
+	•	Data loader: Read from arb_observations (and optionally ingestion_snapshots) for a given date range. Return as a time-sorted array.
+	•	Signal replayer: For each historical data point, feed it through the signal modules. The arb module already accepts inputPrices and inputHistory parameters for exactly this. The trend, reversion, and volatility modules read from the price history module — feed historical prices through signals/history.js’s ingestDataPoints().
+	•	Triple Barrier exit model: For each signal that fires, simulate the trade outcome using three exit conditions: (a) Stop loss — configurable, default 2% for arb, 5% for directional. (b) Take profit — configurable, default 1% for arb (net of fees), 3% for directional. (c) Time limit — configurable, default 30 minutes for arb, 4 hours for directional. Whichever triggers first determines the outcome.
+	•	Fee model: Subtract realistic costs from every simulated trade. For Aerodrome: swap fee (pool-dependent, typically 0.3% for volatile pairs, 0.01% for stable pairs — check the fee_tier field in pool data). For Base: gas cost (~$0.01–$0.05 per swap). For Coinbase: maker/taker fee (0.4%/0.6% at lowest tier). The arb module’s breakeven spread is approximately 40–60bps after all fees — the backtest should confirm or refute this.
+	•	Performance metrics: Compute per signal type and overall: hit rate, average P&L per trade, total P&L, Sharpe ratio (annualized), max drawdown, profit factor (gross gains / gross losses), number of trades.
+Output
+The backtest should produce a JSON report and a human-readable summary. Example structure:
+{ pair, signal_type, date_range, total_trades, hit_rate, avg_pnl_bps, sharpe, max_drawdown_pct, profit_factor }
+Store backtest results in a new backtest_results table (add to migration system) so results are persistent and comparable across runs with different parameters.
+Signal Graduation Criteria
+A signal graduates to Phase 3 (paper trading) when it meets ALL of these over 30+ simulated trades:
+	•	Positive expected value (avg_pnl_bps > 0 after all fees)
+	•	Sharpe ratio > 1.0
+	•	Max drawdown < 15%
+	•	Hit rate > 40% for directional signals, > 55% for arb signals
+	•	Profit factor > 1.5
+
+Hummingbot Learnings to Apply
+Hummingbot is an open-source (Apache 2.0) trading bot framework with years of community-validated patterns. The following findings are directly applicable and should inform the build.
+Triple Barrier Method
+Hummingbot uses Martin Prado’s Triple Barrier Method from “Advances in Financial Machine Learning” for position exits. Three conditions run simultaneously: stop loss (caps downside), take profit (secures gains), time limit (prevents indefinite exposure). Whichever triggers first determines the trade outcome. This is strictly better than the simple “exit after N candles” approach. Implement this in the backtesting harness.
+CEX/DEX Arb Realities
+Key finding: The Hummingbot community consensus is that CEX/DEX arb margins are compressed on low-latency L2s. Base’s 2-second block times mean MEV bots close spreads quickly. However, cross-chain arb (which includes CEX/DEX) has higher margins than CEX-to-CEX because there are fewer competitors. The backtesting should specifically measure: (1) how long spreads persist above the breakeven threshold, (2) what percentage of spreads are exploitable after realistic execution delay (assume 5–10 seconds for a non-MEV agent), and (3) whether gas cost amortization at different position sizes changes profitability.
+Order Book Depth Matters
+Hummingbot’s ArbitrageExecutor calculates optimal order size by examining both order books — as order size increases, profit per unit decreases until convergence. The backtest should include a position sizing sensitivity analysis: how does P&L change at $100, $500, $1000, $5000 position sizes? The arb signal might be profitable at small sizes but unprofitable at sizes that actually matter.
+Quants Lab Pattern
+Hummingbot’s Quants Lab separates data collection from strategy execution using Jupyter notebooks. Consider creating a notebooks/ directory with analysis notebooks for visualizing backtest results. This is optional but useful for iteration.
+
+Expected File Structure
+New files to create (all under market-agent/):
+src/backfill/index.js          — Main backfill orchestrator
+src/backfill/coinbase.js       — Coinbase public candle fetcher
+src/backfill/coingecko.js      — CoinGecko historical price fetcher
+src/backfill/fred.js           — FRED historical series fetcher
+src/backfill/aerodrome.js      — Aerodrome on-chain swap event fetcher
+src/backfill/run.js            — CLI entry point (node src/backfill/run.js)
+src/backtest/harness.js        — Main backtesting engine
+src/backtest/loader.js         — Historical data loader from Postgres
+src/backtest/simulator.js      — Triple Barrier trade simulator
+src/backtest/metrics.js        — Performance metric calculators
+src/backtest/run.js            — CLI entry point (node src/backtest/run.js)
+Modified files:
+src/db/migrate.js              — Add migration v5: backtest_results table
+
+Cost Constraints
+Total API cost for this build should be $0. All historical data sources are free tier. Specifically:
+	•	Coinbase Exchange public candles: Free, no auth, 10 req/sec.
+	•	CoinGecko: Free tier or demo key (already configured). 30 calls/min.
+	•	FRED: Free API key (already configured). 120 req/min.
+	•	Alchemy: Existing key. getLogs is 75 compute units per call out of the free tier’s allocation.
+	•	Postgres: Existing DATABASE_URL. Writes are free (Render managed Postgres on existing plan).
+Do not use the Claude API for backtesting. The qualitative layer is excluded from the initial backtest. We are testing quant signals in isolation first. This is deliberate — it lets us measure whether the conviction modifier adds alpha on top of validated quant signals, rather than testing everything at once.
+Build Sequence
+	•	Step 1: Build the Coinbase and CoinGecko backfill modules first. These are the simplest (REST APIs, well-documented, no auth complexity). Verify data lands in Postgres.
+	•	Step 2: Build the FRED backfill module. Simple extension of existing FRED ingestion code with a wider date range.
+	•	Step 3: Build the Aerodrome on-chain backfill. This is the hardest module — requires decoding Swap events. If this takes too long, fall back to The Graph subgraph historical pool day data as a temporary proxy. Don’t let this block the backtesting harness.
+	•	Step 4: Build the backtesting harness. Start with the arb signal only (it has the clearest validation criteria and the inputPrices/inputHistory parameters). Expand to other signal types after the arb backtest is working.
+	•	Step 5: Run the backtest. Generate the signal report card. Share results.
+What Not To Do
+	•	Do NOT read .env files or touch API keys.
+	•	Do NOT modify the live cycle pipeline (agent.js, server.js, the live ingest modules). The backfill and backtest are separate, offline tools.
+	•	Do NOT use paid API tiers or endpoints that require upgraded accounts.
+	•	Do NOT include the qualitative (Claude API) layer in the backtest. Quant signals only for now.
+	•	Do NOT over-engineer the backfill. If minute-level data is hard to get for a source, hourly is fine. If hourly is hard, daily is fine. Some data is infinitely better than no data.
+	•	Do NOT write tests unless they’re trivially fast. This is a research/validation tool, not production infrastructure. Speed of iteration matters more than coverage.
