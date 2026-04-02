@@ -1,7 +1,7 @@
 {
   "name": "sentinel",
   "version": "0.4.0",
-  "description": "The trust layer for autonomous agents — x402-gated onchain verification",
+  "description": "Trust infrastructure for autonomous AI agents — x402-gated verification, on-chain EAS attestations, agent reputation, and monitoring webhooks on Base",
   "type": "module",
   "main": "server.js",
   "scripts": {
