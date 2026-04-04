@@ -2278,7 +2278,11 @@ app.get("/", (req, res) => {
 app.get("/.well-known/x402", (req, res) => {
   res.json({
     version: 1,
-    description: "Sentinel — trust infrastructure for autonomous AI agents on Base. On-chain verification with EAS attestations, agent reputation tiers, and monitoring webhooks. Pay per query in USDC via x402, no API keys required.",
+    name: "Sentinel — The Trust Layer for Autonomous Agents",
+    title: "Sentinel — The Trust Layer for Autonomous Agents",
+    description: "Trust infrastructure for autonomous AI agents on Base. Verify protocols, tokens, positions, and counterparties with on-chain EAS attestations. 25 free calls/day, then pay per query in USDC via x402.",
+    tags: ["Crypto", "Security", "DeFi", "AI Agents", "Verification"],
+    openapi: `${BASE_URL}/openapi.json`,
     resources: [
       `${BASE_URL}/verify/protocol`,
       `${BASE_URL}/verify/token`,
