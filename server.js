@@ -2220,9 +2220,12 @@ app.get("/admin/audit/summary", async (req, res) => {
 
 // Root — human & agent-friendly service overview
 app.get("/", (req, res) => {
-  // Return HTML landing page for browsers/scrapers (x402scan reads <title> and <meta> tags)
+  // Return JSON only when explicitly requested (e.g. curl with Accept: application/json)
+  // Default to HTML so scrapers/crawlers (x402scan) see <title> and <meta> tags
   const accepts = req.headers.accept || "";
-  if (accepts.includes("text/html")) {
+  if (accepts.includes("application/json") && !accepts.includes("text/html")) {
+    // Skip to JSON response below
+  } else {
     return res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
