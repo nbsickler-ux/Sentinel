@@ -149,6 +149,15 @@ const PRICE = {
 
 // filterResponse, gradeFromScore, DETAIL_LEVELS imported from lib/scoring.js
 
+// Well-known Base addresses for examples and error messages
+const EXAMPLES = {
+  token:        "0x532f27101965dd16442E59d40670FaF5eBB142E4",  // Aerodrome (AERO) on Base
+  protocol:     "0x940181a94A35A4569E4529A3CDfB74e38FD98631",  // Aerodrome AMM Router on Base
+  counterparty: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",  // vitalik.eth
+  position:     "0x940181a94A35A4569E4529A3CDfB74e38FD98631",  // Aerodrome AMM Router
+};
+
+const BASE_URL = "https://sentinel-awms.onrender.com";
 
 // ============================================================
 // CACHING LAYER (Upstash Redis)
@@ -1346,7 +1355,15 @@ app.use(async (req, res, next) => {
     return next();  // Skip x402 payment
   }
 
-  // 2. Free tier: 25 calls/day per IP — no payment required
+  // 2. x402 discovery mode: skip free tier so validators (x402scan, etc.)
+  //    can see the real 402 payment challenge for registration/indexing.
+  //    Usage: POST /verify/token?x402_discover=true
+  if (req.query?.x402_discover === "true" && BYPASS_PATHS.some(p => req.path === p)) {
+    logger.info({ path: req.path, ip: req.ip }, "x402 discovery mode — skipping free tier for validator");
+    return x402Middleware(req, res, next);
+  }
+
+  // 3. Free tier: 25 calls/day per IP — no payment required
   //    Check before x402 so agents can try Sentinel with zero friction.
   //    Once free quota is exhausted, fall through to x402 payment flow.
   if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
@@ -1517,6 +1534,55 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
   });
 }
 
+// ============================================================
+// GET FALLBACK HANDLERS — guide callers who use GET instead of POST
+// These catch the most common DX mistake (GET instead of POST)
+// and return a helpful response with a working curl example.
+// ============================================================
+const GET_FALLBACK_MAP = {
+  "/verify/protocol": {
+    param: "address",
+    example: EXAMPLES.protocol,
+    desc: "contract address to verify",
+  },
+  "/verify/token": {
+    param: "address",
+    example: EXAMPLES.token,
+    desc: "token contract address to check",
+  },
+  "/verify/position": {
+    param: "protocol",
+    example: EXAMPLES.position,
+    desc: "pool or vault contract address",
+  },
+  "/verify/counterparty": {
+    param: "address",
+    example: EXAMPLES.counterparty,
+    desc: "wallet or contract address to screen",
+  },
+  "/preflight": {
+    param: "target",
+    example: EXAMPLES.protocol,
+    desc: "target contract you are about to interact with",
+  },
+};
+
+for (const [path, info] of Object.entries(GET_FALLBACK_MAP)) {
+  app.get(path, (req, res) => {
+    res.status(405).json({
+      error: "This endpoint requires a POST request with a JSON body.",
+      method_received: "GET",
+      method_required: "POST",
+      hint: `Send a POST request with Content-Type: application/json and a JSON body containing '${info.param}' (${info.desc}).`,
+      free_tier: "First 25 calls/day are free — no wallet, no payment, no signup.",
+      example: {
+        curl: `curl -X POST ${BASE_URL}${path} -H "Content-Type: application/json" -d '{"${info.param}": "${info.example}"}'`,
+        body: { [info.param]: info.example, chain: "base" },
+      },
+    });
+  });
+}
+
 /**
  * /verify/protocol - $0.008 per call
  * The highest-value endpoint: answers "is this contract safe to interact with?"
@@ -1526,7 +1592,14 @@ app.post("/verify/protocol", async (req, res) => {
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
-    return res.status(400).json({ error: "Valid contract address required (0x + 40 hex characters)" });
+    return res.status(400).json({
+      error: "Valid contract address required (0x + 40 hex characters)",
+      hint: "Send a POST request with a JSON body containing an 'address' field.",
+      example: {
+        curl: `curl -X POST ${BASE_URL}/verify/protocol -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.protocol}"}'`,
+        body: { address: EXAMPLES.protocol, chain: "base" },
+      },
+    });
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
@@ -1560,7 +1633,14 @@ app.post("/verify/position", async (req, res) => {
   const { protocol: protocolAddress, user, chain = "base", detail = "full" } = params;
 
   if (!protocolAddress || !/^0x[a-fA-F0-9]{40}$/.test(protocolAddress)) {
-    return res.status(400).json({ error: "Valid protocol contract address required (?protocol=0x...)" });
+    return res.status(400).json({
+      error: "Valid protocol contract address required",
+      hint: "Send a POST with JSON body containing a 'protocol' field (the pool/vault contract address).",
+      example: {
+        curl: `curl -X POST ${BASE_URL}/verify/position -H "Content-Type: application/json" -d '{"protocol": "${EXAMPLES.position}"}'`,
+        body: { protocol: EXAMPLES.position, chain: "base" },
+      },
+    });
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
@@ -1600,7 +1680,14 @@ app.post("/verify/counterparty", async (req, res) => {
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
-    return res.status(400).json({ error: "Valid address required (0x + 40 hex characters)" });
+    return res.status(400).json({
+      error: "Valid address required (0x + 40 hex characters)",
+      hint: "Send a POST with JSON body containing an 'address' field (the wallet or contract to check).",
+      example: {
+        curl: `curl -X POST ${BASE_URL}/verify/counterparty -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.counterparty}"}'`,
+        body: { address: EXAMPLES.counterparty, chain: "base" },
+      },
+    });
   }
 
   const { payerWallet, tier, tierTTLs, skipOfac } = await loadAgentContext(req);
@@ -1640,7 +1727,14 @@ app.post("/verify/token", async (req, res) => {
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
-    return res.status(400).json({ error: "Valid token address required (0x + 40 hex characters)" });
+    return res.status(400).json({
+      error: "Valid token address required (0x + 40 hex characters)",
+      hint: "Send a POST with JSON body containing an 'address' field (the token contract to check).",
+      example: {
+        curl: `curl -X POST ${BASE_URL}/verify/token -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.token}"}'`,
+        body: { address: EXAMPLES.token, chain: "base" },
+      },
+    });
   }
 
   const detailLevel = DETAIL_LEVELS.includes(detail) ? detail : "full";
@@ -1724,7 +1818,14 @@ app.post("/preflight", async (req, res) => {
   const { target, token, counterparty, chain = "base", detail = "full" } = params;
 
   if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
-    return res.status(400).json({ error: "Valid target address required (?target=0x... — the contract you're about to interact with)" });
+    return res.status(400).json({
+      error: "Valid target address required (0x + 40 hex characters)",
+      hint: "Send a POST with JSON body containing a 'target' field (the contract you're about to interact with). Optionally include 'token' and 'counterparty' for a more complete check.",
+      example: {
+        curl: `curl -X POST ${BASE_URL}/preflight -H "Content-Type: application/json" -d '{"target": "${EXAMPLES.protocol}", "token": "${EXAMPLES.token}"}'`,
+        body: { target: EXAMPLES.protocol, token: EXAMPLES.token, counterparty: EXAMPLES.counterparty, chain: "base" },
+      },
+    });
   }
   if (token && !/^0x[a-fA-F0-9]{40}$/.test(token)) {
     return res.status(400).json({ error: "Invalid token address format (must be 0x + 40 hex chars)" });
@@ -2137,11 +2238,11 @@ app.get("/", (req, res) => {
     },
     endpoints: {
       verification: [
-        { path: "POST /verify/protocol",     price: "$0.008 USDC (free tier: 25/day)", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
-        { path: "POST /verify/token",         price: "$0.005 USDC (free tier: 25/day)", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
-        { path: "POST /verify/position",      price: "$0.005 USDC (free tier: 25/day)", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
-        { path: "POST /verify/counterparty",  price: "$0.010 USDC (free tier: 25/day)", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
-        { path: "POST /preflight",            price: "$0.025 USDC (free tier: 25/day)", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
+        { path: "POST /verify/protocol",     price: "$0.008 USDC (free tier: 25/day)", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification.", try_it: `curl -X POST ${BASE_URL}/verify/protocol -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.protocol}"}'` },
+        { path: "POST /verify/token",         price: "$0.005 USDC (free tier: 25/day)", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns.", try_it: `curl -X POST ${BASE_URL}/verify/token -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.token}"}'` },
+        { path: "POST /verify/position",      price: "$0.005 USDC (free tier: 25/day)", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization.", try_it: `curl -X POST ${BASE_URL}/verify/position -H "Content-Type: application/json" -d '{"protocol": "${EXAMPLES.position}"}'` },
+        { path: "POST /verify/counterparty",  price: "$0.010 USDC (free tier: 25/day)", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns.", try_it: `curl -X POST ${BASE_URL}/verify/counterparty -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.counterparty}"}'` },
+        { path: "POST /preflight",            price: "$0.025 USDC (free tier: 25/day)", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation.", try_it: `curl -X POST ${BASE_URL}/preflight -H "Content-Type: application/json" -d '{"target": "${EXAMPLES.protocol}", "token": "${EXAMPLES.token}"}'` },
       ],
       free_always: [
         { path: "GET /attestation/:address",  description: "Look up existing Sentinel attestations for any address — see if it's been verified before paying." },
@@ -2164,19 +2265,18 @@ app.get("/", (req, res) => {
 
 // /.well-known/x402 — discovery document for x402scan and agent frameworks
 app.get("/.well-known/x402", (req, res) => {
-  const BASE = "https://sentinel-awms.onrender.com";
   res.json({
     version: 1,
     description: "Sentinel — trust infrastructure for autonomous AI agents on Base. On-chain verification with EAS attestations, agent reputation tiers, and monitoring webhooks. Pay per query in USDC via x402, no API keys required.",
     resources: [
-      `${BASE}/verify/protocol`,
-      `${BASE}/verify/token`,
-      `${BASE}/verify/position`,
-      `${BASE}/verify/counterparty`,
-      `${BASE}/preflight`,
-      `${BASE}/attestation`,
-      `${BASE}/agent`,
-      `${BASE}/watch`,
+      `${BASE_URL}/verify/protocol`,
+      `${BASE_URL}/verify/token`,
+      `${BASE_URL}/verify/position`,
+      `${BASE_URL}/verify/counterparty`,
+      `${BASE_URL}/preflight`,
+      `${BASE_URL}/attestation`,
+      `${BASE_URL}/agent`,
+      `${BASE_URL}/watch`,
     ],
     instructions: [
       "# Sentinel API",
@@ -2192,19 +2292,24 @@ app.get("/.well-known/x402", (req, res) => {
       "All accept POST with JSON body. First 25 calls/day are free, then x402 payment on Base (eip155:8453) in USDC.",
       "",
       "## POST /verify/protocol",
-      "Assess smart contract trustworthiness. Input: { address (required), chain, detail }. Price: free (25/day) then $0.008 USDC.",
+      `Assess smart contract trustworthiness. Input: { "address": "0x..." (required), "chain": "base", "detail": "full" }. Price: free (25/day) then $0.008 USDC.`,
+      `Example: curl -X POST ${BASE_URL}/verify/protocol -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.protocol}"}'`,
       "",
       "## POST /verify/token",
-      "Check token legitimacy and safety. Input: { address (required), chain, detail }. Price: free (25/day) then $0.005 USDC.",
+      `Check token legitimacy and safety. Input: { "address": "0x..." (required), "chain": "base", "detail": "full" }. Price: free (25/day) then $0.005 USDC.`,
+      `Example: curl -X POST ${BASE_URL}/verify/token -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.token}"}'`,
       "",
       "## POST /verify/position",
-      "Analyze DeFi position risk. Input: { address (required), chain, detail }. Price: free (25/day) then $0.005 USDC.",
+      `Analyze DeFi position risk. Input: { "protocol": "0x..." (required), "chain": "base", "detail": "full" }. Price: free (25/day) then $0.005 USDC.`,
+      `Example: curl -X POST ${BASE_URL}/verify/position -H "Content-Type: application/json" -d '{"protocol": "${EXAMPLES.position}"}'`,
       "",
       "## POST /verify/counterparty",
-      "Assess counterparty wallet safety. Input: { address (required), chain, detail }. Price: free (25/day) then $0.010 USDC.",
+      `Assess counterparty wallet safety. Input: { "address": "0x..." (required), "chain": "base", "detail": "full" }. Price: free (25/day) then $0.010 USDC.`,
+      `Example: curl -X POST ${BASE_URL}/verify/counterparty -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.counterparty}"}'`,
       "",
       "## POST /preflight",
-      "Unified pre-transaction safety check. Input: { target (required), chain, token, counterparty, detail }. Price: free (25/day) then $0.025 USDC.",
+      `Unified pre-transaction safety check. Input: { "target": "0x..." (required), "token": "0x..." (optional), "counterparty": "0x..." (optional), "chain": "base", "detail": "full" }. Price: free (25/day) then $0.025 USDC.`,
+      `Example: curl -X POST ${BASE_URL}/preflight -H "Content-Type: application/json" -d '{"target": "${EXAMPLES.protocol}", "token": "${EXAMPLES.token}"}'`,
       "",
       "## Always-Free Endpoints",
       "",
@@ -2252,19 +2357,22 @@ app.get("/openapi.json", (req, res) => {
                   type: "object",
                   required: ["address"],
                   properties: {
-                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Contract address to verify" },
-                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Contract address to verify", example: EXAMPLES.protocol },
+                    chain: { type: "string", default: "base", description: "Chain identifier", example: "base" },
                     detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
                   },
                 },
+                example: { address: EXAMPLES.protocol, chain: "base" },
               },
             },
           },
           responses: {
             "200": { description: "Trust verification result with score, verdict, grade, and evidence" },
             "402": { description: "Payment required — x402 payment details in response headers" },
-            "400": { description: "Invalid address format" },
+            "400": { description: "Invalid address format — response includes a working example" },
+            "405": { description: "Wrong HTTP method — use POST, not GET" },
           },
+          "x-curl-example": `curl -X POST ${BASE_URL}/verify/protocol -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.protocol}"}'`,
         },
       },
       "/verify/token": {
@@ -2282,19 +2390,22 @@ app.get("/openapi.json", (req, res) => {
                   type: "object",
                   required: ["address"],
                   properties: {
-                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Token contract address" },
-                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Token contract address", example: EXAMPLES.token },
+                    chain: { type: "string", default: "base", description: "Chain identifier", example: "base" },
                     detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
                   },
                 },
+                example: { address: EXAMPLES.token, chain: "base" },
               },
             },
           },
           responses: {
             "200": { description: "Token safety result with honeypot detection, tax analysis, and risk flags" },
             "402": { description: "Payment required" },
-            "400": { description: "Invalid address format" },
+            "400": { description: "Invalid address format — response includes a working example" },
+            "405": { description: "Wrong HTTP method — use POST, not GET" },
           },
+          "x-curl-example": `curl -X POST ${BASE_URL}/verify/token -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.token}"}'`,
         },
       },
       "/verify/position": {
@@ -2310,21 +2421,25 @@ app.get("/openapi.json", (req, res) => {
               "application/json": {
                 schema: {
                   type: "object",
-                  required: ["address"],
+                  required: ["protocol"],
                   properties: {
-                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Pool or vault contract address" },
-                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    protocol: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Pool or vault contract address", example: EXAMPLES.position },
+                    user: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "User wallet address (optional, for user-specific position analysis)" },
+                    chain: { type: "string", default: "base", description: "Chain identifier", example: "base" },
                     detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
                   },
                 },
+                example: { protocol: EXAMPLES.position, chain: "base" },
               },
             },
           },
           responses: {
             "200": { description: "Position risk analysis with liquidity and concentration metrics" },
             "402": { description: "Payment required" },
-            "400": { description: "Invalid address format" },
+            "400": { description: "Invalid address format — response includes a working example" },
+            "405": { description: "Wrong HTTP method — use POST, not GET" },
           },
+          "x-curl-example": `curl -X POST ${BASE_URL}/verify/position -H "Content-Type: application/json" -d '{"protocol": "${EXAMPLES.position}"}'`,
         },
       },
       "/verify/counterparty": {
@@ -2342,19 +2457,22 @@ app.get("/openapi.json", (req, res) => {
                   type: "object",
                   required: ["address"],
                   properties: {
-                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Wallet or contract address" },
-                    chain: { type: "string", default: "base", description: "Chain identifier" },
+                    address: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Wallet or contract address", example: EXAMPLES.counterparty },
+                    chain: { type: "string", default: "base", description: "Chain identifier", example: "base" },
                     detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
                   },
                 },
+                example: { address: EXAMPLES.counterparty, chain: "base" },
               },
             },
           },
           responses: {
             "200": { description: "Counterparty intelligence with sanctions check and activity analysis" },
             "402": { description: "Payment required" },
-            "400": { description: "Invalid address format" },
+            "400": { description: "Invalid address format — response includes a working example" },
+            "405": { description: "Wrong HTTP method — use POST, not GET" },
           },
+          "x-curl-example": `curl -X POST ${BASE_URL}/verify/counterparty -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.counterparty}"}'`,
         },
       },
       "/preflight": {
@@ -2372,21 +2490,24 @@ app.get("/openapi.json", (req, res) => {
                   type: "object",
                   required: ["target"],
                   properties: {
-                    target: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Target contract address for the transaction" },
-                    chain: { type: "string", default: "base", description: "Chain identifier" },
-                    token: { type: "string", description: "Token address involved (optional)" },
-                    counterparty: { type: "string", description: "Counterparty wallet address (optional)" },
+                    target: { type: "string", pattern: "^0x[a-fA-F0-9]{40}$", description: "Target contract address for the transaction", example: EXAMPLES.protocol },
+                    chain: { type: "string", default: "base", description: "Chain identifier", example: "base" },
+                    token: { type: "string", description: "Token address involved (optional)", example: EXAMPLES.token },
+                    counterparty: { type: "string", description: "Counterparty wallet address (optional)", example: EXAMPLES.counterparty },
                     detail: { type: "string", enum: ["full", "standard", "minimal"], default: "full", description: "Response detail level" },
                   },
                 },
+                example: { target: EXAMPLES.protocol, token: EXAMPLES.token, counterparty: EXAMPLES.counterparty, chain: "base" },
               },
             },
           },
           responses: {
             "200": { description: "Composite safety analysis with proceed recommendation, individual component scores, and hard-blocker flags" },
             "402": { description: "Payment required" },
-            "400": { description: "Invalid target address" },
+            "400": { description: "Invalid target address — response includes a working example" },
+            "405": { description: "Wrong HTTP method — use POST, not GET" },
           },
+          "x-curl-example": `curl -X POST ${BASE_URL}/preflight -H "Content-Type: application/json" -d '{"target": "${EXAMPLES.protocol}", "token": "${EXAMPLES.token}"}'`,
         },
       },
     },
