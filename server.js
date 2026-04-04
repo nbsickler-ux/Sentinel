@@ -2220,6 +2220,31 @@ app.get("/admin/audit/summary", async (req, res) => {
 
 // Root — human & agent-friendly service overview
 app.get("/", (req, res) => {
+  // Return HTML landing page for browsers/scrapers (x402scan reads <title> and <meta> tags)
+  const accepts = req.headers.accept || "";
+  if (accepts.includes("text/html")) {
+    return res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sentinel — The Trust Layer for Autonomous Agents</title>
+  <meta name="title" content="Sentinel — The Trust Layer for Autonomous Agents">
+  <meta name="description" content="Trust infrastructure for autonomous AI agents on Base. Verify protocols, tokens, positions, and counterparties with on-chain EAS attestations. 25 free calls/day, then pay per query in USDC via x402.">
+  <meta property="og:title" content="Sentinel — The Trust Layer for Autonomous Agents">
+  <meta property="og:description" content="Trust infrastructure for autonomous AI agents on Base. Verify protocols, tokens, positions, and counterparties with on-chain EAS attestations. 25 free calls/day, then pay per query in USDC via x402.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="${BASE_URL}">
+</head>
+<body>
+  <h1>Sentinel</h1>
+  <p>The Trust Layer for Autonomous Agents</p>
+  <p>Trust infrastructure for autonomous AI agents on Base. Every verification creates an on-chain EAS attestation.</p>
+  <p>API Docs: <a href="/openapi.json">/openapi.json</a> | Health: <a href="/health">/health</a></p>
+</body>
+</html>`);
+  }
+
+  // Return JSON for API clients / agents
   res.json({
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
