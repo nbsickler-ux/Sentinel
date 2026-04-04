@@ -161,6 +161,7 @@ const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 
 let redis = null;
 let ratelimit = null;
+let freetierLimit = null;
 
 if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
   redis = new Redis({
@@ -168,15 +169,24 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
     token: UPSTASH_REDIS_REST_TOKEN,
   });
 
-  // Rate limiter: 25 free calls per wallet per day (sliding window)
+  // Rate limiter: 25 calls per wallet per day (sliding window) — safety cap for paid calls
   ratelimit = new Ratelimit({
     redis,
     limiter: Ratelimit.slidingWindow(25, "1 d"),
     prefix: "sentinel:ratelimit",
   });
 
+  // Free tier limiter: 25 calls per IP per day — no payment required
+  // Checked BEFORE x402 middleware. Once exhausted, x402 payment kicks in.
+  freetierLimit = new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(25, "1 d"),
+    prefix: "sentinel:freetier",
+  });
+
   logger.info({ service: "sentinel", feature: "redis" }, "Redis caching enabled (Upstash)");
   logger.info({ service: "sentinel", feature: "ratelimit" }, "Rate limiting enabled: 25 calls/wallet/day");
+  logger.info({ service: "sentinel", feature: "freetier" }, "Free tier enabled: 25 calls/IP/day without payment");
 } else {
   logger.info({ service: "sentinel", feature: "redis" }, "Redis caching disabled (no UPSTASH_REDIS_REST_URL configured)");
 }
@@ -1328,17 +1338,47 @@ const schemes = [
 const LOCAL_BYPASS_SECRET = process.env.LOCAL_BYPASS_SECRET || "";
 const BYPASS_PATHS = ["/verify/protocol", "/verify/token", "/verify/position", "/verify/counterparty", "/preflight"];
 
-// Wrap x402 payment middleware so bypass requests skip it entirely
+// Wrap x402 payment middleware so bypass requests and free-tier requests skip it
 const x402Middleware = paymentMiddlewareFromConfig(paymentRoutes, facilitator, schemes);
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
+  // 1. Local bypass for internal agents (market-agent, testing)
   if (LOCAL_BYPASS_SECRET && req.headers["x-bypass-secret"] === LOCAL_BYPASS_SECRET && BYPASS_PATHS.some(p => req.path === p)) {
     return next();  // Skip x402 payment
   }
+
+  // 2. Free tier: 25 calls/day per IP — no payment required
+  //    Check before x402 so agents can try Sentinel with zero friction.
+  //    Once free quota is exhausted, fall through to x402 payment flow.
+  if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
+    const identifier = (req.ip || req.headers["x-forwarded-for"] || "anonymous").toLowerCase();
+    try {
+      const { success, limit, remaining, reset } = await freetierLimit.limit(identifier);
+
+      // Always set free-tier headers so agents know their quota
+      res.set("X-FreeTier-Limit", String(limit));
+      res.set("X-FreeTier-Remaining", String(remaining));
+      res.set("X-FreeTier-Reset", String(reset));
+
+      if (success) {
+        // Free call — skip x402 payment, mark request as free-tier
+        req.freeTierCall = true;
+        logger.info({ ip: identifier, remaining, path: req.path }, "Free tier call (no payment required)");
+        return next();
+      }
+      // Free quota exhausted — fall through to x402 payment
+      logger.info({ ip: identifier, path: req.path }, "Free tier exhausted, requiring x402 payment");
+    } catch (err) {
+      // If free-tier check fails, fall through to x402 (fail-safe, don't give free calls on error)
+      logger.error({ err }, "Free tier limiter error (falling through to x402)");
+    }
+  }
+
   x402Middleware(req, res, next);  // Normal x402 payment flow
 });
 if (LOCAL_BYPASS_SECRET) {
   console.log("[sentinel] Local bypass enabled for internal agents");
 }
+console.log("[sentinel] Free tier enabled: 25 calls/IP/day without x402 payment");
 
 
 // ============================================================
@@ -1352,6 +1392,11 @@ app.use(PAID_PATHS, async (req, res, next) => {
 
   // Internal agents with bypass secret skip rate limiting
   if (LOCAL_BYPASS_SECRET && req.headers["x-bypass-secret"] === LOCAL_BYPASS_SECRET) {
+    return next();
+  }
+
+  // Free tier calls already passed the freetierLimit check — skip the paid rate limiter
+  if (req.freeTierCall) {
     return next();
   }
 
@@ -1371,7 +1416,7 @@ app.use(PAID_PATHS, async (req, res, next) => {
     if (!success) {
       return res.status(429).json({
         error: "Rate limit exceeded",
-        message: `Free tier allows ${limit} calls per day per wallet. Upgrade or wait until ${new Date(reset).toISOString()}.`,
+        message: `Daily rate limit of ${limit} calls per wallet exceeded. Wait until ${new Date(reset).toISOString()}.`,
         limit,
         remaining: 0,
         reset: new Date(reset).toISOString(),
@@ -2066,13 +2111,19 @@ app.get("/", (req, res) => {
   res.json({
     service: "Sentinel",
     tagline: "The Trust Layer for Autonomous Agents",
-    description: "Sentinel is the trust infrastructure for autonomous AI agents on Base. Every verification is recorded as an on-chain EAS attestation, building a permanent trust record. Returning agents earn reputation tiers for faster, cheaper service. Subscribe to monitoring webhooks for proactive risk alerts. Pay per query in USDC via x402 — no API keys, no accounts, no subscriptions.",
+    description: "Sentinel is the trust infrastructure for autonomous AI agents on Base. Every verification is recorded as an on-chain EAS attestation, building a permanent trust record. Returning agents earn reputation tiers for faster, cheaper service. Subscribe to monitoring webhooks for proactive risk alerts.",
     version: VERSION,
     network: NETWORK,
     base_url: `https://sentinel-awms.onrender.com`,
-    payment_protocol: "x402 (HTTP 402 Payment Required)",
+    free_tier: {
+      calls_per_day: 25,
+      description: "25 free verification calls per day — no wallet, no payment, no signup. Just POST JSON to any /verify/* endpoint. Free tier resets daily. After 25 calls, x402 USDC payment kicks in.",
+      how_to_use: "Send a POST request with a JSON body to any verification endpoint. The first 25 calls per day are free — no x402 payment required. Check X-FreeTier-Remaining response header for your remaining quota.",
+    },
+    payment_protocol: "x402 (HTTP 402 Payment Required) — only after free tier exhausted",
     payment_token: "USDC on Base",
     features: {
+      free_tier: "25 free calls/day per IP — try every endpoint with zero friction, no wallet needed",
       verification: "5 endpoints covering protocol trust, token safety, counterparty screening, position risk, and unified preflight checks",
       attestations: "Every verification produces a permanent EAS attestation on Base — queryable by any agent",
       reputation: "Agent reputation tiers (Unknown → Recognized → Trusted) with progressive speed and cost benefits",
@@ -2086,13 +2137,13 @@ app.get("/", (req, res) => {
     },
     endpoints: {
       verification: [
-        { path: "POST /verify/protocol",     price: "$0.008 USDC", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
-        { path: "POST /verify/token",         price: "$0.005 USDC", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
-        { path: "POST /verify/position",      price: "$0.005 USDC", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
-        { path: "POST /verify/counterparty",  price: "$0.010 USDC", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
-        { path: "POST /preflight",            price: "$0.025 USDC", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
+        { path: "POST /verify/protocol",     price: "$0.008 USDC (free tier: 25/day)", description: "Is this smart contract trustworthy? Checks audit status, TVL, age, and open-source verification." },
+        { path: "POST /verify/token",         price: "$0.005 USDC (free tier: 25/day)", description: "Is this token legitimate? Detects honeypots, fake tokens, tax manipulation, and rugpull patterns." },
+        { path: "POST /verify/position",      price: "$0.005 USDC (free tier: 25/day)", description: "Is this DeFi position safe? Analyzes liquidity depth, IL risk, concentration, and utilization." },
+        { path: "POST /verify/counterparty",  price: "$0.010 USDC (free tier: 25/day)", description: "Is this wallet safe to interact with? Checks OFAC sanctions, contract verification, and activity patterns." },
+        { path: "POST /preflight",            price: "$0.025 USDC (free tier: 25/day)", description: "Should I execute this transaction? Runs all checks in parallel, returns a single go/no-go recommendation." },
       ],
-      free: [
+      free_always: [
         { path: "GET /attestation/:address",  description: "Look up existing Sentinel attestations for any address — see if it's been verified before paying." },
         { path: "GET /agent/:wallet",          description: "Check an agent's reputation tier, verification history, and trust standing." },
         { path: "POST /watch",                price: "$0.05 USDC", description: "Subscribe to monitoring — get webhook alerts when a target's risk changes." },
@@ -2101,12 +2152,12 @@ app.get("/", (req, res) => {
     trust_verdicts: ["SAFE", "MODERATE", "CAUTION", "DANGER"],
     grades: ["A+", "A", "B+", "B", "C+", "C", "D", "F"],
     quick_start: {
-      step_1: "Check GET /attestation/:address to see if your target has a recent trust record",
-      step_2: "If not, send a POST request with JSON body to any verification endpoint",
-      step_3: "Receive HTTP 402 with x402 payment details",
-      step_4: "Sign a USDC payment on Base and include the x402 header",
-      step_5: "Receive the trust verification result — an on-chain attestation is created automatically",
-      example: 'POST /verify/protocol { "address": "0x2626664c2603336e57b271c5c0b26f421741e481", "chain": "base" }',
+      step_1: "Send a POST request with JSON body to any /verify/* endpoint — first 25 calls/day are FREE",
+      step_2: "Receive trust verification result immediately (no payment needed for free tier)",
+      step_3: "Check X-FreeTier-Remaining header to see how many free calls you have left",
+      step_4: "After 25 calls, you'll receive HTTP 402 — sign a USDC payment on Base via x402 to continue",
+      step_5: "Every verification creates a permanent on-chain EAS attestation automatically",
+      example: 'curl -X POST https://sentinel-awms.onrender.com/verify/token -H "Content-Type: application/json" -d \'{"address": "0x532f27101965dd16442E59d40670FaF5eBB142E4", "chain": "base"}\'',
     },
   });
 });
@@ -2131,25 +2182,31 @@ app.get("/.well-known/x402", (req, res) => {
       "# Sentinel API",
       "Trust infrastructure for AI agents on Base. Every verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
       "",
-      "## Paid Verification Endpoints",
-      "All accept POST with JSON body. Payment via x402 on Base (eip155:8453) in USDC.",
+      "## FREE TIER — Try Sentinel with zero friction",
+      "Every verification endpoint includes 25 free calls per day. No wallet, no payment, no signup required.",
+      "Just send a POST request with a JSON body — the first 25 calls per day are completely free.",
+      "Check the X-FreeTier-Remaining response header for your remaining daily quota.",
+      "After 25 calls, x402 USDC payment kicks in automatically.",
+      "",
+      "## Verification Endpoints",
+      "All accept POST with JSON body. First 25 calls/day are free, then x402 payment on Base (eip155:8453) in USDC.",
       "",
       "## POST /verify/protocol",
-      "Assess smart contract trustworthiness. Input: { address (required), chain, detail }. Price: $0.008 USDC.",
+      "Assess smart contract trustworthiness. Input: { address (required), chain, detail }. Price: free (25/day) then $0.008 USDC.",
       "",
       "## POST /verify/token",
-      "Check token legitimacy and safety. Input: { address (required), chain, detail }. Price: $0.005 USDC.",
+      "Check token legitimacy and safety. Input: { address (required), chain, detail }. Price: free (25/day) then $0.005 USDC.",
       "",
       "## POST /verify/position",
-      "Analyze DeFi position risk. Input: { address (required), chain, detail }. Price: $0.005 USDC.",
+      "Analyze DeFi position risk. Input: { address (required), chain, detail }. Price: free (25/day) then $0.005 USDC.",
       "",
       "## POST /verify/counterparty",
-      "Assess counterparty wallet safety. Input: { address (required), chain, detail }. Price: $0.010 USDC.",
+      "Assess counterparty wallet safety. Input: { address (required), chain, detail }. Price: free (25/day) then $0.010 USDC.",
       "",
       "## POST /preflight",
-      "Unified pre-transaction safety check. Input: { target (required), chain, token, counterparty, detail }. Price: $0.025 USDC.",
+      "Unified pre-transaction safety check. Input: { target (required), chain, token, counterparty, detail }. Price: free (25/day) then $0.025 USDC.",
       "",
-      "## Free Endpoints",
+      "## Always-Free Endpoints",
       "",
       "## GET /attestation/:address",
       "Look up existing Sentinel attestations for an address. Check before paying for a fresh verification.",
@@ -2169,13 +2226,14 @@ app.get("/openapi.json", (req, res) => {
     openapi: "3.1.0",
     info: {
       title: "Sentinel — The Trust Layer for Autonomous Agents",
-      description: "Trust infrastructure for autonomous AI agents on Base. On-chain verification with EAS attestations, agent reputation tiers, and proactive monitoring webhooks. Pay per query in USDC via x402 — no API keys, no accounts. Every verification creates a permanent on-chain trust record.",
+      description: "Trust infrastructure for autonomous AI agents on Base. FREE TIER: 25 verification calls per day — no payment, no wallet, no signup. Just POST JSON to any /verify/* endpoint. After 25 calls/day, pay per query in USDC via x402. Every verification creates a permanent on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
       version: VERSION,
       contact: { name: "Sentinel", url: "https://github.com/nbsickler-ux/Sentinel" },
       "x-payment-protocol": "x402",
       "x-payment-token": "USDC",
       "x-payment-network": "Base (eip155:8453)",
-      "x-guidance": "Sentinel is trust infrastructure for autonomous AI agents on Base. All /verify/* and /preflight endpoints require x402 USDC payment. Free endpoints: GET /attestation/:address (check existing trust records before paying), GET /agent/:wallet (reputation lookup), GET /, GET /health, GET /openapi.json. Every paid verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
+      "x-free-tier": "25 calls/day per IP — no payment required. Check X-FreeTier-Remaining response header.",
+      "x-guidance": "Sentinel is trust infrastructure for autonomous AI agents on Base. FREE TIER: All /verify/* and /preflight endpoints allow 25 free calls per day with no payment required — just send a POST with a JSON body. After the free quota, x402 USDC payment is required. Always-free endpoints: GET /attestation/:address (check existing trust records), GET /agent/:wallet (reputation lookup), GET /, GET /health, GET /openapi.json. Every verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
     },
     servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
     paths: {

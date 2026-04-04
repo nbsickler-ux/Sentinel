@@ -1,204 +1,169 @@
-# Sentinel — Integration Guide for Agent Builders
+# Sentinel Integration Guide
+
+**Add trust verification to your agent in under 5 minutes.**
+
+Sentinel is the trust layer for autonomous AI agents on Base. Before your agent swaps a token, enters a DeFi position, or interacts with a contract — Sentinel tells it whether it's safe.
+
+**Free tier: 25 calls/day. No wallet, no payment, no signup.**
+
+---
 
 ## Quick Start
 
-Sentinel is an x402-gated verification API. Your agent pays per request in USDC on Base — no accounts, no API keys, no subscriptions.
+Every verification endpoint works the same way: POST a JSON body with an address, get back a trust verdict.
 
-**Base URL:** `https://sentinel-awms.onrender.com`
+```bash
+curl -X POST https://sentinel-awms.onrender.com/verify/token \
+  -H "Content-Type: application/json" \
+  -d '{"address": "0x532f27101965dd16442E59d40670FaF5eBB142E4", "chain": "base"}'
+```
 
-### How x402 Works
+Response:
 
-1. Your agent sends a GET request to any paid endpoint
-2. Sentinel responds with HTTP `402 Payment Required` and a JSON payment header
-3. Your agent signs a USDC payment on Base and submits it to the x402 facilitator
-4. The facilitator returns payment proof
-5. Your agent re-sends the original request with the payment proof header
-6. Sentinel verifies the proof and returns the trust assessment
+```json
+{
+  "address": "0x532f27101965dd16442E59d40670FaF5eBB142E4",
+  "chain": "base",
+  "token_name": "Brett",
+  "token_symbol": "BRETT",
+  "verdict": "LOW_RISK",
+  "trust_grade": "B",
+  "trust_score": 82,
+  "confidence": 0.9,
+  "risk_flags": ["Slippage is modifiable by owner"],
+  "meta": {
+    "sentinel_version": "0.4.0",
+    "cache_hit": false
+  }
+}
+```
 
-If you're using Coinbase AgentKit or any x402-compatible client, steps 2–5 are handled automatically.
+That's it. No authentication, no API keys, no payment for the first 25 calls/day.
+
+Check the `X-FreeTier-Remaining` response header to see how many free calls you have left.
 
 ---
 
 ## Endpoints
 
-### GET /verify/protocol — $0.008 USDC
-Trust assessment for any smart contract.
+All endpoints accept `POST` with a JSON body.
 
-```
-GET /verify/protocol?address=0x2626664c2603336e57b271c5c0b26f421741e481&chain=base
-```
+| Endpoint | What It Answers | Input |
+|----------|----------------|-------|
+| `POST /verify/protocol` | Is this smart contract trustworthy? | `{ "address": "0x..." }` |
+| `POST /verify/token` | Is this token safe to hold/swap? | `{ "address": "0x..." }` |
+| `POST /verify/position` | Is this DeFi position safe? | `{ "address": "0x..." }` |
+| `POST /verify/counterparty` | Is this wallet safe to interact with? | `{ "address": "0x..." }` |
+| `POST /preflight` | Should I execute this transaction? | `{ "target": "0x..." }` |
 
-**Parameters:**
-- `address` (required) — Contract address (0x + 40 hex chars)
-- `chain` — `base` (default) or `base-sepolia`
-- `detail` — `full` (default), `standard`, or `minimal`
-
-**Returns:** Trust grade (A–F), verdict (SAFE/LOW_RISK/CAUTION/HIGH_RISK/DANGER), audit status, exploit history, contract maturity, TVL stability, risk flags.
+All endpoints accept optional parameters: `chain` (default: `"base"`), `detail` (`"full"`, `"standard"`, or `"minimal"`).
 
 ---
 
-### GET /verify/token — $0.005 USDC
-Token safety check: honeypot detection, tax analysis, ownership risks.
+## Using the Verdict in Your Agent
 
-```
-GET /verify/token?address=0x532f27101965dd16442E59d40670FaF5eBB142E4&chain=base
-```
-
-**Parameters:**
-- `address` (required) — Token contract address
-- `chain` — `base` or `base-sepolia`
-- `detail` — `full`, `standard`, or `minimal`
-
-**Returns:** Honeypot status, buy/sell tax, ownership control flags, holder distribution, trading restrictions.
-
----
-
-### GET /verify/position — $0.005 USDC
-DeFi position risk analysis.
-
-```
-GET /verify/position?protocol=0x2626664c2603336e57b271c5c0b26f421741e481&chain=base
-```
-
-**Parameters:**
-- `protocol` (required) — Protocol contract address
-- `user` (optional) — User wallet address
-- `chain` — `base` or `base-sepolia`
-- `detail` — `full`, `standard`, or `minimal`
-
-**Returns:** Protocol trust foundation, category risk tier, TVL health, concentration risk, actionable recommendations.
-
----
-
-### GET /verify/counterparty — $0.01 USDC
-Counterparty intelligence: sanctions screening, address reputation.
-
-```
-GET /verify/counterparty?address=0x1234...&chain=base
-```
-
-**Parameters:**
-- `address` (required) — Wallet or contract address to screen
-- `chain` — `base` or `base-sepolia`
-- `detail` — `full`, `standard`, or `minimal`
-
-**Returns:** OFAC SDN sanctions check, GoPlus reputation flags (malicious, phishing, cybercrime, mixer, money laundering), exploit association.
-
----
-
-### GET /preflight — $0.025 USDC
-Unified pre-transaction safety check. Combines all verification domains in one call.
-
-```
-GET /preflight?target=0xProtocol...&token=0xToken...&counterparty=0xWallet...&chain=base
-```
-
-**Parameters:**
-- `target` (required) — Primary contract address for the transaction
-- `token` (optional) — Token address involved
-- `counterparty` (optional) — Counterparty wallet address
-- `chain` — `base` or `base-sepolia`
-- `detail` — `full`, `standard`, or `minimal`
-
-**Returns:** Composite trust score, proceed/no-go recommendation, individual grades for each check, aggregated risk flags. Hard blockers (OFAC sanctions, honeypots) automatically override to DANGER.
-
----
-
-### GET /health — Free
-Service status and endpoint catalog. No payment required.
-
-```
-GET /health
-```
-
----
-
-## Response Detail Levels
-
-Control how much data is returned with the `detail` parameter:
-
-- **`full`** — Everything: verdict, grade, score, all dimensions, evidence, risk flags. Best for debugging and analysis.
-- **`standard`** — Verdict, grade, evidence, risk flags. Hides scoring dimension weights. Good for production.
-- **`minimal`** — Verdict and grade only. Fastest parsing, maximum IP protection.
-
----
-
-## Trust Verdict Scale
-
-| Verdict | Grade | Score | Recommended Action |
-|---------|-------|-------|--------------------|
-| SAFE | A | 85–100 | Proceed — no elevated risk |
-| LOW_RISK | B | 70–84 | Proceed — minor flags noted |
-| CAUTION | C | 55–69 | Reduce exposure — notable risks |
-| HIGH_RISK | D | 40–54 | Human review recommended |
-| DANGER | F | 0–39 | Do not proceed |
-
----
-
-## Integration Examples
-
-### Coinbase AgentKit (Node.js)
-
-AgentKit handles x402 payments automatically. Just make the request:
+Every response includes a `verdict` and a `proceed` recommendation (for preflight). Here's how to wire it into your agent's decision loop:
 
 ```javascript
-const response = await fetch(
-  "https://sentinel-awms.onrender.com/verify/protocol?address=0x2626664c2603336e57b271c5c0b26f421741e481&chain=base"
-);
+async function verifyBeforeSwap(tokenAddress) {
+  const res = await fetch("https://sentinel-awms.onrender.com/verify/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ address: tokenAddress, chain: "base" }),
+  });
 
-// AgentKit's x402 client automatically:
-// 1. Receives the 402 response
-// 2. Signs USDC payment on Base
-// 3. Submits to facilitator
-// 4. Retries with payment proof
+  const result = await res.json();
 
-const result = await response.json();
+  // Use the verdict to gate your agent's action
+  if (result.verdict === "DANGER" || result.verdict === "HIGH_RISK") {
+    console.log(`Blocked: ${result.verdict} — ${result.risk_flags.join(", ")}`);
+    return false;
+  }
 
-if (result.verdict === "DANGER" || result.trust_grade === "F") {
-  console.log("DO NOT INTERACT:", result.risk_flags);
-  return;
+  console.log(`Safe to proceed: ${result.verdict} (${result.trust_grade})`);
+  return true;
 }
-
-if (result.verdict === "CAUTION") {
-  console.log("Proceed with reduced exposure:", result.risk_flags);
-}
-
-// Safe to proceed
-console.log(`Protocol rated ${result.trust_grade} — ${result.verdict}`);
 ```
 
-### Pre-Transaction Safety Pattern
+### Preflight Pattern (Recommended)
 
-The recommended pattern for any agent making onchain transactions:
+For transactions involving multiple components (protocol + token + counterparty), use the `/preflight` endpoint. It runs all checks in parallel and returns a single go/no-go:
 
 ```javascript
-async function safeTransaction(targetContract, tokenAddress, counterpartyWallet) {
-  // Single call covers everything
-  const url = new URL("https://sentinel-awms.onrender.com/preflight");
-  url.searchParams.set("target", targetContract);
-  url.searchParams.set("chain", "base");
-  url.searchParams.set("detail", "standard");
-  if (tokenAddress) url.searchParams.set("token", tokenAddress);
-  if (counterpartyWallet) url.searchParams.set("counterparty", counterpartyWallet);
+async function preflightCheck(target, token, counterparty) {
+  const res = await fetch("https://sentinel-awms.onrender.com/preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, token, counterparty, chain: "base" }),
+  });
 
-  const result = await x402Fetch(url.toString());
-  const assessment = await result.json();
+  const result = await res.json();
 
-  if (!assessment.proceed) {
-    throw new Error(`Sentinel blocked: ${assessment.proceed_recommendation}`);
+  if (!result.proceed) {
+    console.log(`BLOCKED: ${result.verdict} — ${result.proceed_recommendation}`);
+    return false;
   }
 
-  if (assessment.trust_grade === "C" || assessment.trust_grade === "D") {
-    // Log caution but allow with reduced size
-    console.warn("Sentinel caution:", assessment.risk_flags);
-    return { proceed: true, reduceExposure: true, flags: assessment.risk_flags };
-  }
-
-  return { proceed: true, reduceExposure: false };
+  // Safe — an EAS attestation is written to Base automatically
+  return true;
 }
 ```
 
-### ElizaOS Plugin
+---
+
+## Coinbase AgentKit Integration
+
+If your agent uses AgentKit, Sentinel works as a pre-execution hook:
+
+```javascript
+import { CdpAgentkit } from "@coinbase/cdp-agentkit-core";
+
+// Add Sentinel as a verification step before any on-chain action
+async function sentinelVerify(address, type = "protocol") {
+  const endpoint = type === "token" ? "/verify/token" : "/verify/protocol";
+  const res = await fetch(`https://sentinel-awms.onrender.com${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ address, chain: "base" }),
+  });
+  return res.json();
+}
+
+// In your agent's action handler:
+const verdict = await sentinelVerify(targetContract);
+if (verdict.trust_score < 55) {
+  // Don't execute — risk is too high
+  return { blocked: true, reason: verdict.risk_flags };
+}
+// Proceed with AgentKit action...
+```
+
+---
+
+## Python Integration
+
+```python
+import requests
+
+def verify_token(address: str, chain: str = "base") -> dict:
+    """Check if a token is safe before swapping."""
+    response = requests.post(
+        "https://sentinel-awms.onrender.com/verify/token",
+        json={"address": address, "chain": chain},
+    )
+    return response.json()
+
+result = verify_token("0x532f27101965dd16442E59d40670FaF5eBB142E4")
+
+if result["verdict"] in ("DANGER", "HIGH_RISK"):
+    print(f"BLOCKED: {result['risk_flags']}")
+else:
+    print(f"Safe: {result['verdict']} ({result['trust_grade']})")
+```
+
+---
+
+## ElizaOS Plugin
 
 ```javascript
 // In your ElizaOS agent action:
@@ -207,46 +172,116 @@ const sentinelCheck = {
   description: "Verify a protocol before interacting",
   handler: async (runtime, message, state) => {
     const address = extractAddress(message.content);
-    const response = await runtime.x402Client.get(
-      `https://sentinel-awms.onrender.com/verify/protocol?address=${address}&chain=base&detail=standard`
+    const response = await fetch(
+      `https://sentinel-awms.onrender.com/verify/protocol`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address, chain: "base", detail: "standard" }),
+      }
     );
-    return `Protocol ${address}: ${response.trust_grade} (${response.verdict}). ${response.risk_flags?.join(". ") || "No flags."}`;
+    const result = await response.json();
+    return `Protocol ${address}: ${result.trust_grade} (${result.verdict}). ${result.risk_flags?.join(". ") || "No flags."}`;
   },
 };
 ```
 
 ---
 
-## Pricing
+## Trust Verdicts
+
+| Verdict | Grade | Score | What To Do |
+|---------|-------|-------|------------|
+| `SAFE` | A | 85-100 | Proceed normally |
+| `LOW_RISK` | B | 70-84 | Proceed — minor flags noted |
+| `CAUTION` | C | 55-69 | Reduce exposure, review flags |
+| `HIGH_RISK` | D | 40-54 | Human review recommended |
+| `DANGER` | F | 0-39 | Do not proceed |
+
+---
+
+## Response Detail Levels
+
+Control how much data comes back with the `detail` parameter:
+
+- **`full`** (default) — Everything: verdict, grade, score, all dimensions, evidence, risk flags
+- **`standard`** — Verdict, grade, evidence, risk flags (hides scoring weights)
+- **`minimal`** — Verdict and grade only — fastest parsing
+
+---
+
+## Free Tier & Pricing
+
+**Free tier**: 25 calls per day per IP address. No wallet or payment required. Resets daily.
+
+After the free tier, x402 payment kicks in automatically:
 
 | Endpoint | Price per call |
 |----------|---------------|
-| /verify/protocol | $0.008 USDC |
-| /verify/token | $0.005 USDC |
-| /verify/position | $0.005 USDC |
-| /verify/counterparty | $0.010 USDC |
-| /preflight | $0.025 USDC |
-| /health | Free |
+| `/verify/protocol` | $0.008 USDC |
+| `/verify/token` | $0.005 USDC |
+| `/verify/position` | $0.005 USDC |
+| `/verify/counterparty` | $0.010 USDC |
+| `/preflight` | $0.025 USDC |
 
-All payments in USDC on Base via x402 protocol.
+Payment is handled by the [x402 protocol](https://www.x402.org) — your agent signs a USDC payment on Base, and the x402 middleware verifies it automatically. If you're using an x402-compatible client, the payment flow is transparent.
+
+### Response Headers
+
+Every response includes free-tier quota headers:
+
+```
+X-FreeTier-Limit: 25
+X-FreeTier-Remaining: 22
+X-FreeTier-Reset: 1711584000000
+```
+
+---
+
+## On-Chain Attestations
+
+Every verification creates an [EAS attestation](https://attest.org) on Base — a permanent, verifiable trust record. Check existing attestations before running a new verification:
+
+```bash
+curl https://sentinel-awms.onrender.com/attestation/0x2626664c2603336e57b271c5c0b26f421741e481
+```
+
+If Sentinel has already verified an address recently, the attestation is on-chain and queryable for free.
+
+Schema UID: [`0xa756c7bbd2cb557265f84698ee0502f4fe118cd12ce409a8970afbd09b7e6d04`](https://base.easscan.org/schema/view/0xa756c7bbd2cb557265f84698ee0502f4fe118cd12ce409a8970afbd09b7e6d04)
+
+---
+
+## Agent Reputation
+
+Agents that verify consistently earn trust tiers with tangible benefits:
+
+| Tier | Requirement | Benefit |
+|------|-------------|---------|
+| Unknown | < 5 verifications | Standard service |
+| Recognized | 5+ verifications | Extended cache windows |
+| Trusted | 20+ verifications | Fastest response times |
+
+Reputation is tracked per wallet address (set by x402 after payment). Check any agent's standing:
+
+```bash
+curl https://sentinel-awms.onrender.com/agent/0xYourWalletAddress
+```
 
 ---
 
 ## Caching
 
-Results are cached for 5–15 minutes depending on the endpoint. Repeated queries for the same address return cached results with `cache_hit: true` in the response metadata. This means sub-50ms responses on cache hits.
+Results are cached for 5-15 minutes depending on the endpoint. Repeated queries for the same address return cached results with `cache_hit: true` in the response metadata — sub-50ms responses on cache hits.
 
 ---
 
-## Network
+## Links
 
-- **Chain:** Base (mainnet)
-- **Payment asset:** USDC
-- **Protocol:** x402
-- **Facilitator:** Coinbase production facilitator
+- **Live API**: [sentinel-awms.onrender.com](https://sentinel-awms.onrender.com)
+- **OpenAPI Spec**: [/openapi.json](https://sentinel-awms.onrender.com/openapi.json)
+- **x402 Discovery**: [/.well-known/x402](https://sentinel-awms.onrender.com/.well-known/x402)
+- **GitHub**: [github.com/nbsickler-ux/Sentinel](https://github.com/nbsickler-ux/Sentinel)
+- **EAS Schema**: [View on Base EAS](https://base.easscan.org/schema/view/0xa756c7bbd2cb557265f84698ee0502f4fe118cd12ce409a8970afbd09b7e6d04)
 
----
-
-## Questions?
-
-sentinel@dosomethingcollective.com
+Questions or integration help? Open an issue on GitHub or email sentinel@dosomethingcollective.com
