@@ -1363,7 +1363,18 @@ app.use(async (req, res, next) => {
     return x402Middleware(req, res, next);
   }
 
-  // 3. Free tier: 25 calls/day per IP — no payment required
+  // 3. Empty-body probe bypass: if a POST to a paid endpoint has no JSON body,
+  //    it's a validator/crawler probing for the 402 challenge (e.g. x402scan "Add Server").
+  //    Skip free tier so the real 402 payment response is returned.
+  if (BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
+    const hasBody = req.body && typeof req.body === "object" && Object.keys(req.body).length > 0;
+    if (!hasBody) {
+      logger.info({ path: req.path, ip: req.ip }, "Empty-body probe — skipping free tier for 402 challenge");
+      return x402Middleware(req, res, next);
+    }
+  }
+
+  // 4. Free tier: 25 calls/day per IP — no payment required
   //    Check before x402 so agents can try Sentinel with zero friction.
   //    Once free quota is exhausted, fall through to x402 payment flow.
   if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
