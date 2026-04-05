@@ -178,10 +178,11 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
     token: UPSTASH_REDIS_REST_TOKEN,
   });
 
-  // Rate limiter: 25 calls per wallet per day (sliding window) — safety cap for paid calls
+  // Rate limiter: 1000 calls per wallet per day (sliding window) — safety cap for paid calls
+  // This is a guardrail, not a business constraint. Paying customers should not hit this.
   ratelimit = new Ratelimit({
     redis,
-    limiter: Ratelimit.slidingWindow(25, "1 d"),
+    limiter: Ratelimit.slidingWindow(1000, "1 d"),
     prefix: "sentinel:ratelimit",
   });
 
@@ -194,7 +195,7 @@ if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
   });
 
   logger.info({ service: "sentinel", feature: "redis" }, "Redis caching enabled (Upstash)");
-  logger.info({ service: "sentinel", feature: "ratelimit" }, "Rate limiting enabled: 25 calls/wallet/day");
+  logger.info({ service: "sentinel", feature: "ratelimit" }, "Rate limiting enabled: 1000 calls/wallet/day (safety cap)");
   logger.info({ service: "sentinel", feature: "freetier" }, "Free tier enabled: 25 calls/IP/day without payment");
 } else {
   logger.info({ service: "sentinel", feature: "redis" }, "Redis caching disabled (no UPSTASH_REDIS_REST_URL configured)");
@@ -1363,16 +1364,10 @@ app.use(async (req, res, next) => {
     return x402Middleware(req, res, next);
   }
 
-  // 3. Empty-body probe bypass: if a POST to a paid endpoint has no JSON body,
-  //    it's a validator/crawler probing for the 402 challenge (e.g. x402scan "Add Server").
-  //    Skip free tier so the real 402 payment response is returned.
-  if (BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
-    const hasBody = req.body && typeof req.body === "object" && Object.keys(req.body).length > 0;
-    if (!hasBody) {
-      logger.info({ path: req.path, ip: req.ip }, "Empty-body probe — skipping free tier for 402 challenge");
-      return x402Middleware(req, res, next);
-    }
-  }
+  // 3. Empty-body probe bypass REMOVED — the x402_discover=true param (above)
+  //    already handles validators. Empty-body POSTs from real agents should fall
+  //    through to the endpoint handler, which returns a helpful 400 validation
+  //    error instead of a confusing 402 payment challenge they can't complete.
 
   // 4. Free tier: 25 calls/day per IP — no payment required
   //    Check before x402 so agents can try Sentinel with zero friction.
@@ -1444,7 +1439,8 @@ app.use(PAID_PATHS, async (req, res, next) => {
     if (!success) {
       return res.status(429).json({
         error: "Rate limit exceeded",
-        message: `Daily rate limit of ${limit} calls per wallet exceeded. Wait until ${new Date(reset).toISOString()}.`,
+        message: `Daily safety cap of ${limit} paid calls per wallet exceeded. Resets at ${new Date(reset).toISOString()}.`,
+        hint: "This is a safety guardrail. If you need higher limits, contact Sentinel.",
         limit,
         remaining: 0,
         reset: new Date(reset).toISOString(),
@@ -2572,7 +2568,7 @@ app.get("/health", (req, res) => {
     network: NETWORK,
     facilitator: (CDP_API_KEY_ID && CDP_API_KEY_SECRET) ? "cdp (coinbase)" : "x402.org",
     cache: redis ? "enabled" : "disabled",
-    rate_limit: ratelimit ? "25 calls/wallet/day free tier" : "disabled",
+    rate_limit: ratelimit ? "25 free calls/IP/day, then 1000 paid calls/wallet/day" : "disabled",
     attestation_enabled: isEASEnabled(),
     registry_loaded: registryLoaded,
     registry_size: Object.keys(protocolRegistry).length,
