@@ -1385,7 +1385,7 @@ app.use(async (req, res, next) => {
   // 4. Free tier: 25 calls/day per IP — no payment required
   //    Check before x402 so agents can try Sentinel with zero friction.
   //    Once free quota is exhausted, fall through to x402 payment flow.
-  if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && (req.method === "POST" || req.method === "GET")) {
+  if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && (req.method === "POST" || req.method === "GET" || req.method === "HEAD")) {
     const identifier = (req.ip || req.headers["x-forwarded-for"] || "anonymous").toLowerCase();
     try {
       const { success, limit, remaining, reset } = await freetierLimit.limit(identifier);
@@ -1403,8 +1403,8 @@ app.use(async (req, res, next) => {
       }
       // Free quota exhausted — fall through to x402 payment (POST only)
       logger.info({ ip: identifier, path: req.path, method: req.method }, "Free tier exhausted, requiring x402 payment");
-      if (req.method === "GET") {
-        // GET requests don't have x402 payment routes — return a helpful 402
+      if (req.method === "GET" || req.method === "HEAD") {
+        // GET/HEAD requests don't have x402 payment routes — return a helpful 402
         return res.status(402).json({
           error: "Free tier exhausted (25 calls/day). Use POST with x402 payment to continue.",
           hint: "Switch to POST requests with x402 USDC payment headers for unlimited access.",
@@ -1567,49 +1567,8 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
 // These catch the most common DX mistake (GET instead of POST)
 // and return a helpful response with a working curl example.
 // ============================================================
-const GET_FALLBACK_MAP = {
-  "/verify/protocol": {
-    param: "address",
-    example: EXAMPLES.protocol,
-    desc: "contract address to verify",
-  },
-  "/verify/token": {
-    param: "address",
-    example: EXAMPLES.token,
-    desc: "token contract address to check",
-  },
-  "/verify/position": {
-    param: "protocol",
-    example: EXAMPLES.position,
-    desc: "pool or vault contract address",
-  },
-  "/verify/counterparty": {
-    param: "address",
-    example: EXAMPLES.counterparty,
-    desc: "wallet or contract address to screen",
-  },
-  "/preflight": {
-    param: "target",
-    example: EXAMPLES.protocol,
-    desc: "target contract you are about to interact with",
-  },
-};
-
-for (const [path, info] of Object.entries(GET_FALLBACK_MAP)) {
-  app.get(path, (req, res) => {
-    res.status(405).json({
-      error: "This endpoint requires a POST request with a JSON body.",
-      method_received: "GET",
-      method_required: "POST",
-      hint: `Send a POST request with Content-Type: application/json and a JSON body containing '${info.param}' (${info.desc}).`,
-      free_tier: "First 25 calls/day are free — no wallet, no payment, no signup.",
-      example: {
-        curl: `curl -X POST ${BASE_URL}${path} -H "Content-Type: application/json" -d '{"${info.param}": "${info.example}"}'`,
-        body: { [info.param]: info.example, chain: "base" },
-      },
-    });
-  });
-}
+// GET fallback 405 handlers REMOVED — verify endpoints now accept GET via app.all()
+// (see each endpoint handler below). GET with ?address=0x... works on the free tier.
 
 // ============================================================
 // INPUT NORMALIZATION MIDDLEWARE
