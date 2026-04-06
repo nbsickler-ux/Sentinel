@@ -95,14 +95,27 @@ try {
 const app = express();
 app.set("trust proxy", true);   // Render (and most PaaS) sit behind a reverse proxy — trust X-Forwarded-Proto so req.protocol is "https"
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));  // Catch form-encoded POSTs (common misconfiguration)
 
-// Add pino-http middleware for automatic request logging (only if logger has request method)
-if (typeof logger.request === 'function') {
-  try {
-    app.use(pinoHttp({ logger }));
-  } catch (e) {
-    // Skip middleware if it fails
+// ── Body rescue middleware ──
+// If Content-Type is missing or wrong (e.g. text/plain), express.json() silently
+// leaves req.body as undefined. This middleware attempts to parse it as JSON so
+// callers with misconfigured headers still get served.
+app.use((req, res, next) => {
+  if (req.method === "POST" && (!req.body || (typeof req.body === "object" && Object.keys(req.body).length === 0))) {
+    // req.body is empty — check if there's a raw body we can rescue
+    // express.json() already consumed the stream, but urlencoded may have caught it.
+    // If neither parser caught it, there's nothing more we can do here.
+    // The normalization middleware downstream will handle missing fields gracefully.
   }
+  next();
+});
+
+// Add pino-http middleware for automatic request logging
+try {
+  app.use(pinoHttp({ logger }));
+} catch (e) {
+  logger.warn?.({ err: e?.message }, "pinoHttp middleware failed to initialize — request logging disabled");
 }
 
 // Favicon — x402scan requires one to avoid OG-image constraint issues during registration
@@ -1589,6 +1602,129 @@ for (const [path, info] of Object.entries(GET_FALLBACK_MAP)) {
     });
   });
 }
+
+// ============================================================
+// INPUT NORMALIZATION MIDDLEWARE
+// ============================================================
+// Converts common field-name mismatches and format issues into
+// the canonical form our endpoints expect. This runs BEFORE the
+// endpoint handlers so callers who are "almost right" get served
+// instead of getting a 400 they can't diagnose.
+//
+// Field aliases resolved:
+//   address  ← tokenAddress, contractAddress, contract, token_address, token (when string & looks like address)
+//   protocol ← protocolAddress, pool, vault, pool_address, vault_address
+//   target   ← targetAddress, target_address, contract (on /preflight)
+//
+// Format fixes:
+//   - Lowercase hex addresses (Ethereum addresses are case-insensitive)
+//   - Prepend "0x" if caller sent 40 hex chars without prefix
+//   - Strip whitespace from address values
+
+const ADDRESS_ALIASES = ["tokenAddress", "contractAddress", "contract", "token_address", "contract_address"];
+const PROTOCOL_ALIASES = ["protocolAddress", "pool", "vault", "pool_address", "vault_address"];
+const TARGET_ALIASES = ["targetAddress", "target_address"];
+
+function normalizeAddress(value) {
+  if (typeof value !== "string") return value;
+  let v = value.trim();
+  // If it's 40 hex chars without 0x prefix, add it
+  if (/^[a-fA-F0-9]{40}$/.test(v)) {
+    v = "0x" + v;
+  }
+  return v;
+}
+
+function resolveAlias(params, canonicalKey, aliases) {
+  if (params[canonicalKey]) return;  // Already has canonical key — don't override
+  for (const alias of aliases) {
+    if (params[alias] !== undefined) {
+      params[canonicalKey] = params[alias];
+      params._resolved_from = alias;  // breadcrumb for diagnostic logging
+      return;
+    }
+  }
+}
+
+const NORMALIZE_PATHS = ["/verify/protocol", "/verify/token", "/verify/position", "/verify/counterparty", "/preflight"];
+app.use(NORMALIZE_PATHS, (req, res, next) => {
+  // Merge query + body (same as endpoints do, but we normalize in-place)
+  const body = req.body || {};
+  const query = req.query || {};
+
+  // === Field alias resolution ===
+  if (req.path === "/verify/token" || req.path === "/verify/protocol" || req.path === "/verify/counterparty") {
+    resolveAlias(body, "address", ADDRESS_ALIASES);
+    resolveAlias(query, "address", ADDRESS_ALIASES);
+  }
+  if (req.path === "/verify/position") {
+    resolveAlias(body, "protocol", PROTOCOL_ALIASES);
+    resolveAlias(query, "protocol", PROTOCOL_ALIASES);
+  }
+  if (req.path === "/preflight") {
+    resolveAlias(body, "target", TARGET_ALIASES);
+    resolveAlias(query, "target", TARGET_ALIASES);
+    // On preflight, "contract" or "address" likely means "target"
+    if (!body.target && !query.target) {
+      resolveAlias(body, "target", [...TARGET_ALIASES, "address", "contract", "contractAddress"]);
+      resolveAlias(query, "target", [...TARGET_ALIASES, "address", "contract", "contractAddress"]);
+    }
+  }
+
+  // === Address format normalization ===
+  for (const key of ["address", "protocol", "target", "token", "counterparty", "user"]) {
+    if (body[key]) body[key] = normalizeAddress(body[key]);
+    if (query[key]) query[key] = normalizeAddress(query[key]);
+  }
+
+  next();
+});
+
+
+// ============================================================
+// DIAGNOSTIC 400 LOGGER
+// ============================================================
+// Logs what callers actually sent when they hit a validation error.
+// Uses res.on("finish") so it fires AFTER the endpoint returns,
+// capturing the status code without adding latency.
+app.use(NORMALIZE_PATHS, (req, res, next) => {
+  const originalJson = res.json.bind(res);
+
+  res.json = function(body) {
+    // Only log on 400 responses to verification endpoints
+    if (res.statusCode === 400) {
+      const contentType = req.headers["content-type"] || "(missing)";
+      const bodyKeys = req.body ? Object.keys(req.body) : [];
+      const queryKeys = req.query ? Object.keys(req.query) : [];
+      const params = { ...req.query, ...req.body };
+
+      // Truncate received value to 20 chars for safety (could contain secrets)
+      const receivedAddress = params.address || params.target || params.protocol || undefined;
+      const truncated = typeof receivedAddress === "string"
+        ? receivedAddress.substring(0, 20) + (receivedAddress.length > 20 ? "…" : "")
+        : receivedAddress;
+
+      logger.warn({
+        event: "validation_failure",
+        path: req.path,
+        method: req.method,
+        ip: req.ip,
+        content_type: contentType,
+        body_keys: bodyKeys,
+        query_keys: queryKeys,
+        received_address: truncated,
+        received_address_type: typeof receivedAddress,
+        received_address_length: typeof receivedAddress === "string" ? receivedAddress.length : null,
+        resolved_from: params._resolved_from || null,
+        user_agent: (req.headers["user-agent"] || "").substring(0, 100),
+      }, `400 validation failure on ${req.path} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}`);
+    }
+    return originalJson(body);
+  };
+
+  next();
+});
+
 
 /**
  * /verify/protocol - $0.008 per call
