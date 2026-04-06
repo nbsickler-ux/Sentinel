@@ -1385,7 +1385,7 @@ app.use(async (req, res, next) => {
   // 4. Free tier: 25 calls/day per IP — no payment required
   //    Check before x402 so agents can try Sentinel with zero friction.
   //    Once free quota is exhausted, fall through to x402 payment flow.
-  if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && req.method === "POST") {
+  if (freetierLimit && BYPASS_PATHS.some(p => req.path === p) && (req.method === "POST" || req.method === "GET")) {
     const identifier = (req.ip || req.headers["x-forwarded-for"] || "anonymous").toLowerCase();
     try {
       const { success, limit, remaining, reset } = await freetierLimit.limit(identifier);
@@ -1401,8 +1401,16 @@ app.use(async (req, res, next) => {
         logger.info({ ip: identifier, remaining, path: req.path }, "Free tier call (no payment required)");
         return next();
       }
-      // Free quota exhausted — fall through to x402 payment
-      logger.info({ ip: identifier, path: req.path }, "Free tier exhausted, requiring x402 payment");
+      // Free quota exhausted — fall through to x402 payment (POST only)
+      logger.info({ ip: identifier, path: req.path, method: req.method }, "Free tier exhausted, requiring x402 payment");
+      if (req.method === "GET") {
+        // GET requests don't have x402 payment routes — return a helpful 402
+        return res.status(402).json({
+          error: "Free tier exhausted (25 calls/day). Use POST with x402 payment to continue.",
+          hint: "Switch to POST requests with x402 USDC payment headers for unlimited access.",
+          reset: reset,
+        });
+      }
     } catch (err) {
       // If free-tier check fails, fall through to x402 (fail-safe, don't give free calls on error)
       logger.error({ err }, "Free tier limiter error (falling through to x402)");
@@ -1730,17 +1738,19 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
  * /verify/protocol - $0.008 per call
  * The highest-value endpoint: answers "is this contract safe to interact with?"
  */
-app.post("/verify/protocol", async (req, res) => {
+// GET+POST: AI agents often default to GET with query params
+app.all("/verify/protocol", async (req, res) => {
   const params = { ...req.query, ...req.body };
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({
-      error: "Valid contract address required (0x + 40 hex characters)",
-      hint: "Send a POST request with a JSON body containing an 'address' field.",
-      example: {
-        curl: `curl -X POST ${BASE_URL}/verify/protocol -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.protocol}"}'`,
-        body: { address: EXAMPLES.protocol, chain: "base" },
+      error: "Missing required field 'address'. Send {\"address\": \"0x...\"} as JSON body, or use ?address=0x... as query param. Example address: " + EXAMPLES.protocol,
+      required_params: [{ name: "address", type: "string", format: "0x + 40 hex chars", description: "Contract address to verify" }],
+      optional_params: [{ name: "chain", default: "base" }, { name: "detail", default: "full", values: ["full", "summary", "score"] }],
+      example_request: {
+        GET: `${BASE_URL}/verify/protocol?address=${EXAMPLES.protocol}`,
+        POST: { url: `${BASE_URL}/verify/protocol`, headers: { "Content-Type": "application/json" }, body: { address: EXAMPLES.protocol } },
       },
     });
   }
@@ -1771,17 +1781,19 @@ app.post("/verify/protocol", async (req, res) => {
  * /verify/position - $0.005 per call
  * DeFi position risk analysis: protocol trust + category risk + TVL health + concentration
  */
-app.post("/verify/position", async (req, res) => {
+// GET+POST: AI agents often default to GET with query params
+app.all("/verify/position", async (req, res) => {
   const params = { ...req.query, ...req.body };
   const { protocol: protocolAddress, user, chain = "base", detail = "full" } = params;
 
   if (!protocolAddress || !/^0x[a-fA-F0-9]{40}$/.test(protocolAddress)) {
     return res.status(400).json({
-      error: "Valid protocol contract address required",
-      hint: "Send a POST with JSON body containing a 'protocol' field (the pool/vault contract address).",
-      example: {
-        curl: `curl -X POST ${BASE_URL}/verify/position -H "Content-Type: application/json" -d '{"protocol": "${EXAMPLES.position}"}'`,
-        body: { protocol: EXAMPLES.position, chain: "base" },
+      error: "Missing required field 'protocol'. Send {\"protocol\": \"0x...\"} as JSON body, or use ?protocol=0x... as query param. Example address: " + EXAMPLES.position,
+      required_params: [{ name: "protocol", type: "string", format: "0x + 40 hex chars", description: "Pool/vault contract address to analyze" }],
+      optional_params: [{ name: "user", description: "Wallet address for position-specific analysis" }, { name: "chain", default: "base" }, { name: "detail", default: "full", values: ["full", "summary", "score"] }],
+      example_request: {
+        GET: `${BASE_URL}/verify/position?protocol=${EXAMPLES.position}`,
+        POST: { url: `${BASE_URL}/verify/position`, headers: { "Content-Type": "application/json" }, body: { protocol: EXAMPLES.position } },
       },
     });
   }
@@ -1818,17 +1830,19 @@ app.post("/verify/position", async (req, res) => {
  * /verify/counterparty - $0.01 per call
  * Counterparty intelligence: OFAC sanctions, address reputation, exploit association
  */
-app.post("/verify/counterparty", async (req, res) => {
+// GET+POST: AI agents often default to GET with query params
+app.all("/verify/counterparty", async (req, res) => {
   const params = { ...req.query, ...req.body };
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({
-      error: "Valid address required (0x + 40 hex characters)",
-      hint: "Send a POST with JSON body containing an 'address' field (the wallet or contract to check).",
-      example: {
-        curl: `curl -X POST ${BASE_URL}/verify/counterparty -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.counterparty}"}'`,
-        body: { address: EXAMPLES.counterparty, chain: "base" },
+      error: "Missing required field 'address'. Send {\"address\": \"0x...\"} as JSON body, or use ?address=0x... as query param. Example address: " + EXAMPLES.counterparty,
+      required_params: [{ name: "address", type: "string", format: "0x + 40 hex chars", description: "Wallet or contract address to screen" }],
+      optional_params: [{ name: "chain", default: "base" }, { name: "detail", default: "full", values: ["full", "summary", "score"] }],
+      example_request: {
+        GET: `${BASE_URL}/verify/counterparty?address=${EXAMPLES.counterparty}`,
+        POST: { url: `${BASE_URL}/verify/counterparty`, headers: { "Content-Type": "application/json" }, body: { address: EXAMPLES.counterparty } },
       },
     });
   }
@@ -1864,18 +1878,20 @@ app.post("/verify/counterparty", async (req, res) => {
  * /verify/token - $0.005 per call
  * Token safety assessment: honeypot, tax, ownership, holder distribution
  */
-app.post("/verify/token", async (req, res) => {
+// GET+POST: AI agents often default to GET with query params
+app.all("/verify/token", async (req, res) => {
   const startTime = Date.now();
   const params = { ...req.query, ...req.body };
   const { address, chain = "base", detail = "full" } = params;
 
   if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({
-      error: "Valid token address required (0x + 40 hex characters)",
-      hint: "Send a POST with JSON body containing an 'address' field (the token contract to check).",
-      example: {
-        curl: `curl -X POST ${BASE_URL}/verify/token -H "Content-Type: application/json" -d '{"address": "${EXAMPLES.token}"}'`,
-        body: { address: EXAMPLES.token, chain: "base" },
+      error: "Missing required field 'address'. Send {\"address\": \"0x...\"} as JSON body, or use ?address=0x... as query param. Example address: " + EXAMPLES.token,
+      required_params: [{ name: "address", type: "string", format: "0x + 40 hex chars", description: "Token contract address to verify" }],
+      optional_params: [{ name: "chain", default: "base" }, { name: "detail", default: "full", values: ["full", "summary", "score"] }],
+      example_request: {
+        GET: `${BASE_URL}/verify/token?address=${EXAMPLES.token}`,
+        POST: { url: `${BASE_URL}/verify/token`, headers: { "Content-Type": "application/json" }, body: { address: EXAMPLES.token } },
       },
     });
   }
@@ -1956,17 +1972,19 @@ app.post("/verify/token", async (req, res) => {
  * Runs protocol trust + token safety + counterparty screening + position risk in parallel
  * Returns a single go/no-go verdict with component grades
  */
-app.post("/preflight", async (req, res) => {
+// GET+POST: AI agents often default to GET with query params
+app.all("/preflight", async (req, res) => {
   const params = { ...req.query, ...req.body };
   const { target, token, counterparty, chain = "base", detail = "full" } = params;
 
   if (!target || !/^0x[a-fA-F0-9]{40}$/.test(target)) {
     return res.status(400).json({
-      error: "Valid target address required (0x + 40 hex characters)",
-      hint: "Send a POST with JSON body containing a 'target' field (the contract you're about to interact with). Optionally include 'token' and 'counterparty' for a more complete check.",
-      example: {
-        curl: `curl -X POST ${BASE_URL}/preflight -H "Content-Type: application/json" -d '{"target": "${EXAMPLES.protocol}", "token": "${EXAMPLES.token}"}'`,
-        body: { target: EXAMPLES.protocol, token: EXAMPLES.token, counterparty: EXAMPLES.counterparty, chain: "base" },
+      error: "Missing required field 'target'. Send {\"target\": \"0x...\"} as JSON body, or use ?target=0x... as query param. Example address: " + EXAMPLES.protocol,
+      required_params: [{ name: "target", type: "string", format: "0x + 40 hex chars", description: "Contract address you are about to interact with" }],
+      optional_params: [{ name: "token", description: "Token contract for additional safety check" }, { name: "counterparty", description: "Counterparty wallet to screen" }, { name: "chain", default: "base" }, { name: "detail", default: "full", values: ["full", "summary", "score"] }],
+      example_request: {
+        GET: `${BASE_URL}/preflight?target=${EXAMPLES.protocol}&token=${EXAMPLES.token}`,
+        POST: { url: `${BASE_URL}/preflight`, headers: { "Content-Type": "application/json" }, body: { target: EXAMPLES.protocol, token: EXAMPLES.token } },
       },
     });
   }
