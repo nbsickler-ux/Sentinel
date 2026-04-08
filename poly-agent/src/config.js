@@ -4,7 +4,8 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Load shared .env from Sentinel root
+// Load .env — check Render secret file first, then local Sentinel root
+dotenv.config({ path: "/etc/secrets/.env" });
 dotenv.config({ path: resolve(__dirname, "../../.env") });
 
 export default {
@@ -195,7 +196,7 @@ export default {
   },
 
   // ── Server ──
-  port: parseInt(process.env.POLY_AGENT_PORT || "4040", 10),
+  port: parseInt(process.env.PORT || process.env.POLY_AGENT_PORT || "4040", 10),
   env: process.env.NODE_ENV || "development",
   logLevel: process.env.LOG_LEVEL || "info",
 };
