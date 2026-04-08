@@ -10,7 +10,11 @@ import logger from "../logger.js";
 const { Pool } = pg;
 
 export const pool = config.database.url
-  ? new Pool({ connectionString: config.database.url, max: 5 })
+  ? new Pool({
+      connectionString: config.database.url,
+      max: 5,
+      ssl: { rejectUnauthorized: false },
+    })
   : null;
 
 /**

@@ -128,16 +128,24 @@ async function kalshiPublicRequest(path, params = {}) {
  */
 export async function getMarkets(opts = {}) {
   const params = {};
-  if (opts.category) params.category = opts.category;
+  // Kalshi /markets supports: status, series_ticker, event_ticker, limit, cursor
+  // Category filtering is done client-side after fetching
   if (opts.seriesTicker) params.series_ticker = opts.seriesTicker;
+  if (opts.eventTicker) params.event_ticker = opts.eventTicker;
   if (opts.status) params.status = opts.status;
-  params.limit = opts.limit || 100;
+  params.limit = opts.limit || 200;
   if (opts.cursor) params.cursor = opts.cursor;
 
+  logger.info({ module: "kalshi", params, category: opts.category }, "Fetching Kalshi markets");
   const resp = await kalshiPublicRequest("/markets", params);
-  const markets = resp?.markets || [];
 
-  logger.debug({ module: "kalshi", count: markets.length, category: opts.category }, "Fetched markets");
+  if (!resp) {
+    logger.error({ module: "kalshi" }, "Kalshi /markets returned null — API may be unreachable");
+    return [];
+  }
+
+  const markets = resp?.markets || [];
+  logger.info({ module: "kalshi", total: markets.length, category: opts.category }, "Kalshi markets fetched");
   return markets;
 }
 

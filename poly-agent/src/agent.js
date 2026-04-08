@@ -68,26 +68,23 @@ async function discoverMarkets() {
   // ── Kalshi discovery ──
   if (config.platforms?.kalshi?.enabled) {
     try {
-      // Kalshi categories we care about from config
-      const kalshiCategories = config.platforms.kalshi.categories || ["sports"];
-      for (const cat of kalshiCategories) {
-        const markets = await kalshi.getMarkets({ category: cat, status: "open", limit: 100 });
-        for (const m of markets) {
-          allMarkets.push({
-            id: m.ticker,
-            question: m.title || m.subtitle || m.ticker,
-            platform: "kalshi",
-            sport: cat,
-            active: m.status === "open",
-            // Normalize pricing: Kalshi yes_price is in cents (0-100), convert to 0-1
-            lastYesPrice: (m.yes_ask || m.last_price || 0) / 100,
-            lastNoPrice: (m.no_ask || (100 - (m.last_price || 0))) / 100,
-            ticker: m.ticker,
-            closeTime: m.close_time || m.expiration_time,
-            volume: m.volume || 0,
-            rawData: m,
-          });
-        }
+      // Fetch all open markets in one call (no server-side category filter)
+      const markets = await kalshi.getMarkets({ status: "open", limit: 200 });
+      for (const m of markets) {
+        allMarkets.push({
+          id: m.ticker,
+          question: m.title || m.subtitle || m.ticker,
+          platform: "kalshi",
+          sport: m.category || "unknown",
+          active: m.status === "open" || m.status === "active",
+          // Normalize pricing: Kalshi prices may be in cents (0-100) or decimal (0-1)
+          lastYesPrice: m.yes_ask != null ? (m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask) : (m.last_price != null ? (m.last_price > 1 ? m.last_price / 100 : m.last_price) : 0.5),
+          lastNoPrice: m.no_ask != null ? (m.no_ask > 1 ? m.no_ask / 100 : m.no_ask) : 0.5,
+          ticker: m.ticker,
+          closeTime: m.close_time || m.expiration_time,
+          volume: m.volume || 0,
+          rawData: m,
+        });
       }
       logger.info({ module: "agent", platform: "kalshi", found: allMarkets.filter(m => m.platform === "kalshi").length }, "Kalshi markets discovered");
     } catch (err) {
