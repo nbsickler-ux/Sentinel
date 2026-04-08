@@ -127,20 +127,24 @@ async function kalshiPublicRequest(path, params = {}) {
  * @param {string} [opts.cursor] - Pagination cursor
  */
 export async function getMarkets(opts = {}) {
-  const params = {};
-  // Kalshi /markets supports: status, series_ticker, event_ticker, limit, cursor
-  // Category filtering is done client-side after fetching
-  if (opts.seriesTicker) params.series_ticker = opts.seriesTicker;
-  if (opts.eventTicker) params.event_ticker = opts.eventTicker;
-  if (opts.status) params.status = opts.status;
-  params.limit = opts.limit || 200;
-  if (opts.cursor) params.cursor = opts.cursor;
+  // Build query string for authenticated GET request
+  const queryParts = [];
+  if (opts.seriesTicker) queryParts.push(`series_ticker=${encodeURIComponent(opts.seriesTicker)}`);
+  if (opts.eventTicker) queryParts.push(`event_ticker=${encodeURIComponent(opts.eventTicker)}`);
+  if (opts.status) queryParts.push(`status=${encodeURIComponent(opts.status)}`);
+  queryParts.push(`limit=${opts.limit || 200}`);
+  if (opts.cursor) queryParts.push(`cursor=${encodeURIComponent(opts.cursor)}`);
 
-  logger.info({ module: "kalshi", params, category: opts.category }, "Fetching Kalshi markets");
-  const resp = await kalshiPublicRequest("/markets", params);
+  const queryString = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
+  const path = `/markets${queryString}`;
+
+  logger.info({ module: "kalshi", path, category: opts.category }, "Fetching Kalshi markets (authenticated)");
+
+  // Use authenticated request — Kalshi requires auth even for market data
+  const resp = await kalshiRequest("GET", path);
 
   if (!resp) {
-    logger.error({ module: "kalshi" }, "Kalshi /markets returned null — API may be unreachable");
+    logger.error({ module: "kalshi" }, "Kalshi /markets returned null — API may be unreachable or auth failed");
     return [];
   }
 
@@ -153,7 +157,7 @@ export async function getMarkets(opts = {}) {
  * Fetch a single market by ticker.
  */
 export async function getMarket(ticker) {
-  const resp = await kalshiPublicRequest(`/markets/${ticker}`);
+  const resp = await kalshiRequest("GET", `/markets/${ticker}`);
   return resp?.market || null;
 }
 
@@ -161,12 +165,13 @@ export async function getMarket(ticker) {
  * Fetch events (grouped markets).
  */
 export async function getEvents(opts = {}) {
-  const params = {};
-  if (opts.category) params.category = opts.category;
-  if (opts.status) params.status = opts.status;
-  params.limit = opts.limit || 50;
+  const queryParts = [];
+  if (opts.category) queryParts.push(`category=${encodeURIComponent(opts.category)}`);
+  if (opts.status) queryParts.push(`status=${encodeURIComponent(opts.status)}`);
+  queryParts.push(`limit=${opts.limit || 50}`);
+  const qs = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
 
-  const resp = await kalshiPublicRequest("/events", params);
+  const resp = await kalshiRequest("GET", `/events${qs}`);
   return resp?.events || [];
 }
 
@@ -177,7 +182,7 @@ export async function getEvents(opts = {}) {
  * Returns bids, asks, spread, and depth.
  */
 export async function getOrderbook(ticker) {
-  const resp = await kalshiPublicRequest(`/markets/${ticker}/orderbook`);
+  const resp = await kalshiRequest("GET", `/markets/${ticker}/orderbook`);
   if (!resp?.orderbook) return null;
 
   const book = resp.orderbook;
