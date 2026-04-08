@@ -1,9 +1,18 @@
 node_modules/
+package-lock.json
 .env
 .env.local
+.env.*
 *.log
 .DS_Store
 .~lock.*
+
+# Word temp files (the ~$filename.docx files)
+~$*
+
+# Secrets / keys
+*.pem
+*.key
 
 # Confidential docs — never commit to public repo
 docs/CONFIDENTIAL-*
