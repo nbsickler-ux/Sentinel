@@ -41,8 +41,8 @@ export default {
     },
     kalshi: {
       enabled: !!process.env.KALSHI_API_KEY_ID,
-      baseUrl: process.env.KALSHI_BASE_URL || "https://api.kalshi.com/trade-api/v2",
-      wsUrl: process.env.KALSHI_WS_URL || "wss://api.kalshi.com/trade-api/ws/v2",
+      baseUrl: process.env.KALSHI_BASE_URL || "https://trading-api.kalshi.com/trade-api/v2",
+      wsUrl: process.env.KALSHI_WS_URL || "wss://trading-api.kalshi.com/trade-api/ws/v2",
       apiKeyId: process.env.KALSHI_API_KEY_ID || "",
       privateKeyPath: process.env.KALSHI_PRIVATE_KEY_PATH || "",
       privateKeyPem: process.env.KALSHI_PRIVATE_KEY_PEM || "",
