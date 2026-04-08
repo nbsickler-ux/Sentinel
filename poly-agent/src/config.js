@@ -132,25 +132,42 @@ export default {
 
   // ═══════════════════════════════════════════════
   // POSITION MANAGEMENT & EXIT RULES
+  // All numbers derived from Kalshi fee structure
+  // (0.07 × P × (1-P) per contract, ~1.75¢ max at 50¢,
+  //  round-trip ~3.5¢ at midpoint) and observed
+  // cross-platform gap behavior (2-8¢ persist for hours).
   // ═══════════════════════════════════════════════
   exits: {
-    // ── Profit-taking ──
-    // Take profit when edge compresses (market caught up to our estimate)
+    // ── Edge compression (primary exit) ──
+    // Exit when bookmaker-derived edge compresses below exit fee.
+    // Single-side exit fee ≈ 1.75¢ at midpoint, so exiting at <2¢
+    // remaining edge means we'd lose money paying to get out.
     edgeCompressedCents: parseFloat(process.env.POLY_EXIT_EDGE_COMPRESS || "2"),
-    // Take profit on absolute price move in our favor
-    profitTargetCents: parseFloat(process.env.POLY_EXIT_PROFIT_TARGET || "8"),
 
-    // ── Stop loss ──
-    // Exit if price moves against us by this much
-    stopLossCents: parseFloat(process.env.POLY_EXIT_STOP_LOSS || "12"),
+    // ── Stop loss (bookmaker-referenced) ──
+    // If bookmaker edge flips negative or drops below 2¢, the thesis
+    // is dead — the market corrected or we were wrong.
+    // This replaces a fixed price-based stop with a thesis-based one.
+    bookmakerStopEdgeCents: parseFloat(process.env.POLY_EXIT_BM_STOP || "2"),
 
-    // ── Time-based ──
-    // If we're still holding and game is about to start, re-evaluate
-    // Hold through resolution only if remaining edge > this threshold
+    // ── Hard stop (catastrophic fallback) ──
+    // Fixed price-based stop at -15¢ in case bookmaker data stales out.
+    // Set at ~2× max expected edge (8¢) so it only fires in true blowups.
+    hardStopCents: parseFloat(process.env.POLY_EXIT_HARD_STOP || "15"),
+
+    // ── Time-based exit ──
+    // If < 30 min to event start AND remaining edge < 4¢, exit.
+    // Rationale: spreads widen as liquidity thins pre-event,
+    // and 4¢ edge won't survive the wider exit spread.
+    timeExitMinutes: parseFloat(process.env.POLY_EXIT_TIME_MINUTES || "30"),
+    timeExitMinEdgeCents: parseFloat(process.env.POLY_EXIT_TIME_MIN_EDGE || "4"),
+
+    // ── Hold-through-resolution ──
+    // If edge is still strong (>5¢) at event start, hold to resolution
+    // to avoid paying exit fees. Binary resolution = $1 or $0.
     holdThroughMinEdgeCents: parseFloat(process.env.POLY_HOLD_THROUGH_EDGE || "5"),
 
     // ── Position check frequency ──
-    // How often to evaluate exit conditions on open positions
     checkIntervalMs: parseInt(process.env.POLY_EXIT_CHECK || "30000", 10), // 30s
   },
 
@@ -161,8 +178,12 @@ export default {
     maxDailyLossPct: 0.03,          // 3% daily stop
     maxDrawdownPct: 0.10,           // 10% from peak
     maxConsecutiveLosses: 5,
-    minEdgeCents: 5,                // Minimum 5¢ (5pp) edge to trade
-    minConfidence: 0.6,             // Minimum Claude confidence
+    // Entry thresholds (derived from round-trip cost ~5¢):
+    //   6¢ = log-only threshold (barely clears fees, worth tracking)
+    //   7¢ = trade threshold (2¢ buffer over round-trip cost)
+    minEdgeCentsLog: 6,             // Log edges at 6¢+ for calibration
+    minEdgeCents: 7,                // Execute trades at 7¢+ only
+    minConfidence: 0.6,             // Minimum bookmaker consensus confidence
     kellyFraction: 0.25,            // Quarter-Kelly
     positionReductionOnStreak: 0.5, // 50% size reduction after loss streak
   },

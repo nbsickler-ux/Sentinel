@@ -23,7 +23,7 @@ import logger from "./logger.js";
 import * as kalshi from "./execution/kalshi.js";
 import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
 import { fetchAllOdds } from "./execution/bookmaker.js";
-import { findEdges, evaluateExits as evaluateEdgeExits } from "./analysis/edge.js";
+import { findEdges } from "./analysis/edge.js";
 import { checkCircuitBreaker } from "./risk/circuit-breaker.js";
 import { createProposal, approveProposal } from "./execution/manager.js";
 import { evaluateExits as evaluatePositionExits } from "./execution/positions.js";
@@ -198,25 +198,42 @@ async function oddsScanCycle() {
     state.detectedEdges = edges;
 
     if (edges.length > 0) {
+      const tradeEligible = edges.filter(e => e.tradeEligible);
+      const logOnly = edges.filter(e => !e.tradeEligible);
       state.stats.edgesDetected += edges.length;
+
       logger.info({
         module: "agent",
-        edges: edges.length,
+        total: edges.length,
+        tradeEligible: tradeEligible.length,
+        logOnly: logOnly.length,
         topEdge: `${edges[0].ticker} ${edges[0].side} ${edges[0].edgeCents}¢`,
         topFairValue: edges[0].fairValue?.toFixed(3),
         topKalshiPrice: edges[0].kalshiPrice?.toFixed(3),
       }, "Edges detected");
 
-      // Act on edges
-      for (const edge of edges) {
+      // Log-only edges (6-6¢ range) get recorded for calibration but never traded
+      for (const edge of logOnly) {
+        state.tradeLog.push({
+          timestamp: Date.now(),
+          type: "edge_logged",
+          ...edge,
+          executed: false,
+          reason: "below_trade_threshold",
+        });
+      }
+
+      // Trade-eligible edges (7¢+) go through the execution pipeline
+      for (const edge of tradeEligible) {
         await actOnEdge(edge);
       }
     }
   }
 
   // ── EVALUATE EXITS on open positions ──
+  // Pass bookmaker events so exits can re-compare to fair value
   try {
-    await evaluatePositionExits(state.latestOdds, new Map()); // No analysis results needed
+    await evaluatePositionExits(state.latestOdds, state.bookmakerOdds);
   } catch (err) {
     // Positions module might not have open positions yet
   }
@@ -225,6 +242,9 @@ async function oddsScanCycle() {
 // ── EDGE EXECUTION ──
 
 async function actOnEdge(edge) {
+  // Safety check: only trade-eligible edges (7¢+) should reach here
+  if (!edge.tradeEligible) return;
+
   const breaker = await checkCircuitBreaker();
   if (!breaker.allowed) {
     logger.warn({ module: "agent", reason: breaker.reason, market: edge.ticker }, "Circuit breaker blocked");

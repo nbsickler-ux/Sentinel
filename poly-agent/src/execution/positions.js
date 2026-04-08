@@ -12,24 +12,16 @@ import { pool } from "../db/schema.js";
 import config from "../config.js";
 import logger from "../logger.js";
 import { placeLimitOrder, cancelOrder, getOrderbook } from "./polymarket.js";
-import { estimateFairValue } from "../analysis/engine.js";
-
-const {
-  edgeCompressedCents,
-  profitTargetCents,
-  stopLossCents,
-  holdThroughMinEdgeCents,
-  checkIntervalMs,
-} = config.exits;
+import { evaluateExits as evaluateEdgeExits } from "../analysis/edge.js";
 
 /**
  * Evaluate exit conditions for all open positions.
- * Called on every odds scan cycle.
+ * Delegates to edge.js for bookmaker-referenced exit logic.
  *
  * @param {Map} latestOdds - condition_id → { yes, no, timestamp }
- * @param {Map} analysisResults - condition_id → latest fair value estimate
+ * @param {Array} bookmakerEvents - Latest bookmaker events for fair value comparison
  */
-export async function evaluateExits(latestOdds, analysisResults) {
+export async function evaluateExits(latestOdds, bookmakerEvents) {
   if (!pool) return [];
 
   const exits = [];
@@ -39,34 +31,55 @@ export async function evaluateExits(latestOdds, analysisResults) {
       `SELECT * FROM poly_positions WHERE status = 'open' ORDER BY opened_at ASC`
     );
 
-    for (const pos of positions) {
+    if (positions.length === 0) return [];
+
+    // Normalize DB positions into the format edge.js expects
+    const normalizedPositions = positions.map(pos => ({
+      marketId: pos.condition_id,
+      ticker: pos.token_id,
+      side: pos.direction === "buy_yes" ? "yes" : "no",
+      entryPrice: parseFloat(pos.entry_price),
+      question: pos.market_question,
+      commenceTime: pos.close_time || null,  // If stored
+      dbId: pos.id,
+      dbRow: pos,
+    }));
+
+    // Run the bookmaker-referenced exit evaluation from edge.js
+    const exitActions = evaluateEdgeExits(normalizedPositions, latestOdds, bookmakerEvents);
+
+    for (const action of exitActions) {
+      const pos = positions.find(p => p.condition_id === action.marketId);
+      if (!pos) continue;
+
       const odds = latestOdds.get(pos.condition_id);
-      if (!odds) continue; // No current price data
+      const currentPrice = pos.direction === "buy_yes" ? odds?.yes : odds?.no;
+      if (currentPrice == null) continue;
 
-      const analysis = analysisResults.get(pos.condition_id);
-      const currentPrice = pos.direction === "buy_yes" ? odds.yes : odds.no;
-      const entryPrice = parseFloat(pos.entry_price);
-      const priceDelta = (currentPrice - entryPrice) * 100; // In cents, positive = profit
+      const exitDecision = {
+        shouldExit: action.action === "exit",
+        reason: action.detail || action.reason,
+        type: action.reason,
+        priceDelta: action.pnlCents,
+        currentEdgeCents: action.currentEdgeCents,
+      };
 
-      const exitDecision = evaluateSinglePosition({
-        position: pos,
-        currentPrice,
-        entryPrice,
-        priceDelta,
-        analysis,
-        odds,
-      });
-
-      if (exitDecision.shouldExit) {
+      if (action.action === "exit") {
         exits.push({ position: pos, ...exitDecision });
 
-        // Execute the exit
         if (config.mode !== "analysis") {
           await executeExit(pos, exitDecision, currentPrice);
         } else {
-          // Analysis mode: log the exit as if it happened
           await recordPaperExit(pos, exitDecision, currentPrice);
         }
+      } else if (action.action === "hold") {
+        logger.info({
+          module: "positions",
+          market: pos.market_question?.slice(0, 50),
+          reason: action.reason,
+          edge: `${action.currentEdgeCents}¢`,
+          minutes: action.minutesToEvent,
+        }, "Position held through resolution");
       }
     }
 
@@ -74,7 +87,7 @@ export async function evaluateExits(latestOdds, analysisResults) {
       logger.info({
         module: "positions",
         exits: exits.length,
-        reasons: exits.map((e) => e.reason),
+        reasons: exits.map((e) => e.type),
       }, "Position exits evaluated");
     }
 
@@ -82,96 +95,6 @@ export async function evaluateExits(latestOdds, analysisResults) {
   } catch (err) {
     logger.error({ module: "positions", err: err.message }, "Exit evaluation failed");
     return [];
-  }
-}
-
-/**
- * Evaluate exit conditions for a single position.
- * Returns { shouldExit, reason, type, urgency }
- */
-function evaluateSinglePosition({ position, currentPrice, entryPrice, priceDelta, analysis, odds }) {
-  // ── STOP LOSS: Hard exit on adverse move ──
-  if (priceDelta <= -stopLossCents) {
-    return {
-      shouldExit: true,
-      reason: `Stop loss: ${priceDelta.toFixed(1)}¢ move against (limit: -${stopLossCents}¢)`,
-      type: "stop_loss",
-      urgency: "immediate",
-      priceDelta,
-    };
-  }
-
-  // ── PROFIT TARGET: Take profit on strong favorable move ──
-  if (priceDelta >= profitTargetCents) {
-    return {
-      shouldExit: true,
-      reason: `Profit target: +${priceDelta.toFixed(1)}¢ (target: +${profitTargetCents}¢)`,
-      type: "profit_target",
-      urgency: "normal",
-      priceDelta,
-    };
-  }
-
-  // ── EDGE COMPRESSION: Market caught up to our estimate ──
-  // This is the most important exit. Our edge was speed — once the
-  // market reflects the information, holding is pure gambling.
-  if (analysis) {
-    const currentEdge = calculateCurrentEdge(position, analysis, currentPrice);
-
-    if (priceDelta > 0 && Math.abs(currentEdge) <= edgeCompressedCents) {
-      return {
-        shouldExit: true,
-        reason: `Edge compressed: remaining edge ${currentEdge.toFixed(1)}¢ (threshold: ${edgeCompressedCents}¢). Profit: +${priceDelta.toFixed(1)}¢`,
-        type: "edge_compressed",
-        urgency: "normal",
-        priceDelta,
-        remainingEdge: currentEdge,
-      };
-    }
-  }
-
-  // ── RE-EVALUATION: Our analysis changed direction ──
-  if (analysis && analysis.direction) {
-    const ourSide = position.direction; // buy_yes or buy_no
-    const claudeNow = analysis.direction;
-
-    // If Claude now says the other side, or no_trade, and we're not in profit
-    if (claudeNow !== ourSide && claudeNow !== "no_trade" && priceDelta < 2) {
-      return {
-        shouldExit: true,
-        reason: `Analysis flipped: entered ${ourSide}, Claude now says ${claudeNow}. P&L: ${priceDelta.toFixed(1)}¢`,
-        type: "analysis_reversal",
-        urgency: "normal",
-        priceDelta,
-      };
-    }
-  }
-
-  // ── HOLD THROUGH RESOLUTION CHECK ──
-  // If the event is about to resolve, decide whether to hold or sell
-  // Only relevant if the position is in profit and has remaining edge
-  // (Otherwise stop-loss or profit-target would have caught it)
-
-  // No exit triggered
-  return {
-    shouldExit: false,
-    reason: null,
-    priceDelta,
-    currentPrice,
-  };
-}
-
-/**
- * Calculate the current edge given updated analysis.
- * Positive = still in our favor. Negative = market moved past our estimate.
- */
-function calculateCurrentEdge(position, analysis, currentPrice) {
-  if (!analysis?.fair_probability) return 0;
-
-  if (position.direction === "buy_yes") {
-    return (analysis.fair_probability - currentPrice) * 100;
-  } else {
-    return ((1 - analysis.fair_probability) - (1 - currentPrice)) * 100;
   }
 }
 
@@ -246,11 +169,14 @@ async function updatePositionClosed(position, exitDecision, exitPrice) {
 
   // Map exit type to status
   const statusMap = {
+    hard_stop: "closed_sl",
+    bookmaker_stop_negative: "closed_bm_stop",
+    bookmaker_stop_compressed: "closed_bm_stop",
+    edge_compressed_profit: "closed_edge",
+    time_exit: "closed_time",
     stop_loss: "closed_sl",
     profit_target: "closed_tp",
     edge_compressed: "closed_edge",
-    analysis_reversal: "closed_reversal",
-    hold_expired: "closed_expired",
   };
   const status = statusMap[exitDecision.type] || "closed";
 
