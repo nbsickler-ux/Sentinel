@@ -21,7 +21,8 @@
 
 import config from "./config.js";
 import logger from "./logger.js";
-import { getMarkets, getPrice } from "./execution/polymarket.js";
+import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
+import * as kalshi from "./execution/kalshi.js";
 import { fetchAllNews } from "./ingest/news.js";
 import {
   estimateFairValue,
@@ -39,11 +40,11 @@ import { pool } from "./db/schema.js";
 const state = {
   watchedMarkets: [],
   latestNews: null,
-  latestOdds: new Map(),         // condition_id → { yes, no, timestamp }
-  previousOdds: new Map(),       // condition_id → previous snapshot
-  analysisResults: new Map(),    // condition_id → latest fair value estimate
-  lastAnalysisTime: new Map(),   // condition_id → timestamp of last analysis
-  lastAnalysisPrice: new Map(),  // condition_id → price at time of last analysis
+  latestOdds: new Map(),         // marketId → { yes, no, timestamp }
+  previousOdds: new Map(),       // marketId → previous snapshot
+  analysisResults: new Map(),    // marketId → latest fair value estimate
+  lastAnalysisTime: new Map(),   // marketId → timestamp of last analysis
+  lastAnalysisPrice: new Map(),  // marketId → price at time of last analysis
   cycleCount: 0,
   lastNewsScan: 0,
   lastOddsScan: 0,
@@ -62,29 +63,80 @@ const state = {
 // ── MARKET DISCOVERY ──
 
 async function discoverMarkets() {
-  // Pull tags from config — covers everything from NBA to esports to F1
-  const enabledSports = config.sports
-    ? Object.values(config.sports).filter((s) => s.enabled).map((s) => s.tag)
-    : ["nba", "mlb", "nhl"];
   const allMarkets = [];
 
-  for (const tag of enabledSports) {
-    const markets = await getMarkets({ tag, limit: 30 });
-    allMarkets.push(...markets.map((m) => ({ ...m, sport: tag })));
+  // ── Kalshi discovery ──
+  if (config.platforms?.kalshi?.enabled) {
+    try {
+      // Kalshi categories we care about from config
+      const kalshiCategories = config.platforms.kalshi.categories || ["sports"];
+      for (const cat of kalshiCategories) {
+        const markets = await kalshi.getMarkets({ category: cat, status: "open", limit: 100 });
+        for (const m of markets) {
+          allMarkets.push({
+            id: m.ticker,
+            question: m.title || m.subtitle || m.ticker,
+            platform: "kalshi",
+            sport: cat,
+            active: m.status === "open",
+            // Normalize pricing: Kalshi yes_price is in cents (0-100), convert to 0-1
+            lastYesPrice: (m.yes_ask || m.last_price || 0) / 100,
+            lastNoPrice: (m.no_ask || (100 - (m.last_price || 0))) / 100,
+            ticker: m.ticker,
+            closeTime: m.close_time || m.expiration_time,
+            volume: m.volume || 0,
+            rawData: m,
+          });
+        }
+      }
+      logger.info({ module: "agent", platform: "kalshi", found: allMarkets.filter(m => m.platform === "kalshi").length }, "Kalshi markets discovered");
+    } catch (err) {
+      logger.error({ module: "agent", platform: "kalshi", err: err.message }, "Kalshi discovery failed");
+    }
   }
 
-  // Deduplicate
+  // ── Polymarket discovery ──
+  if (config.platforms?.polymarket?.enabled) {
+    try {
+      const enabledSports = config.sports
+        ? Object.values(config.sports).filter((s) => s.enabled).map((s) => s.tag)
+        : ["nba", "mlb", "nhl"];
+      for (const tag of enabledSports) {
+        const markets = await getPolymarketMarkets({ tag, limit: 30 });
+        for (const m of markets) {
+          allMarkets.push({
+            id: m.condition_id || m.id,
+            question: m.question || m.title,
+            platform: "polymarket",
+            sport: tag,
+            active: m.active,
+            lastYesPrice: m.tokens?.[0]?.price || 0,
+            lastNoPrice: m.tokens?.[1]?.price || 0,
+            tokens: m.tokens,
+            condition_id: m.condition_id,
+            rawData: m,
+          });
+        }
+      }
+      logger.info({ module: "agent", platform: "polymarket", found: allMarkets.filter(m => m.platform === "polymarket").length }, "Polymarket markets discovered");
+    } catch (err) {
+      logger.error({ module: "agent", platform: "polymarket", err: err.message }, "Polymarket discovery failed");
+    }
+  }
+
+  // Deduplicate by id
   const seen = new Set();
   state.watchedMarkets = allMarkets.filter((m) => {
-    const id = m.condition_id || m.id;
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return m.active && m.tokens?.length >= 2;
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return m.active;
   });
 
   logger.info({
     module: "agent",
     watching: state.watchedMarkets.length,
+    kalshi: state.watchedMarkets.filter(m => m.platform === "kalshi").length,
+    polymarket: state.watchedMarkets.filter(m => m.platform === "polymarket").length,
   }, "Market discovery complete");
 
   return state.watchedMarkets;
@@ -109,8 +161,8 @@ function shouldAnalyzeMarket(conditionId, currentPrice) {
   }
 
   // Find the market for game-time proximity check
-  const market = state.watchedMarkets.find((m) => m.condition_id === conditionId);
-  const endDate = market?.endDate || market?.end_date_iso;
+  const market = state.watchedMarkets.find((m) => m.id === conditionId);
+  const endDate = market?.closeTime || market?.endDate || market?.end_date_iso;
   const hoursToResolution = endDate
     ? (new Date(endDate).getTime() - now) / (1000 * 60 * 60)
     : Infinity;
@@ -206,9 +258,9 @@ async function handleHighImpactEvent(newsEvent) {
   const correlated = await findCorrelatedMarkets({
     newsEvent,
     activeMarkets: state.watchedMarkets.slice(0, 25).map((m) => ({
-      conditionId: m.condition_id,
+      conditionId: m.id,
       question: m.question,
-      yesPrice: parseFloat(m.outcomePrices?.[0] || 0.5),
+      yesPrice: m.lastYesPrice || 0.5,
     })),
   });
 
@@ -223,7 +275,7 @@ async function handleHighImpactEvent(newsEvent) {
 
     for (const affected of correlated.affected_markets) {
       const market = state.watchedMarkets.find(
-        (m) => m.condition_id?.startsWith(affected.condition_id)
+        (m) => m.id?.startsWith(affected.condition_id)
       );
       if (market) {
         // Force analysis regardless of trigger (this IS the trigger)
@@ -242,20 +294,29 @@ async function oddsScanCycle() {
 
   // Update prices on watched markets
   for (const market of state.watchedMarkets.slice(0, 20)) {
-    const condId = market.condition_id;
-    const price = await getPrice(market);
+    const marketId = market.id;
+    let price;
+    try {
+      if (market.platform === "kalshi") {
+        price = await kalshi.getPrice(market.ticker);
+      } else {
+        price = await getPolymarketPrice(market);
+      }
+    } catch (err) {
+      continue;
+    }
     if (!price || price.yes == null) continue;
 
-    const prev = state.latestOdds.get(condId);
-    if (prev) state.previousOdds.set(condId, prev);
-    state.latestOdds.set(condId, price);
+    const prev = state.latestOdds.get(marketId);
+    if (prev) state.previousOdds.set(marketId, prev);
+    state.latestOdds.set(marketId, price);
 
     // Record to DB (non-blocking)
     if (pool) {
       pool.query(
         `INSERT INTO poly_odds_history (condition_id, yes_price, no_price)
          VALUES ($1, $2, $3)`,
-        [condId, price.yes, price.no]
+        [marketId, price.yes, price.no]
       ).catch(() => {});
     }
 
@@ -265,7 +326,7 @@ async function oddsScanCycle() {
       if (moveCents > 5) {
         const minutesSince = (now - prev.timestamp) / 60_000;
         const overreaction = await detectOverreaction({
-          market: { question: market.question, conditionId: condId },
+          market: { question: market.question, conditionId: marketId },
           priceBefore: prev.yes,
           priceNow: price.yes,
           minutesSinceMove: Math.round(minutesSince),
@@ -286,7 +347,7 @@ async function oddsScanCycle() {
     }
 
     // EVENT-DRIVEN: Check if this market needs re-analysis
-    const trigger = shouldAnalyzeMarket(condId, price.yes);
+    const trigger = shouldAnalyzeMarket(marketId, price.yes);
     if (trigger.shouldAnalyze) {
       await analyzeMarket(market, false);
     } else {
@@ -305,8 +366,8 @@ async function oddsScanCycle() {
  * Creates proposals or auto-executes depending on operating mode.
  */
 async function analyzeMarket(market, forced = false) {
-  const condId = market.condition_id;
-  const odds = state.latestOdds.get(condId);
+  const marketId = market.id;
+  const odds = state.latestOdds.get(marketId);
   if (!odds) return null;
 
   // Build context
@@ -319,9 +380,10 @@ async function analyzeMarket(market, forced = false) {
   const estimate = await estimateFairValue({
     market: {
       question: market.question,
-      conditionId: condId,
-      endDate: market.endDate || market.end_date_iso,
-      category: market.category || "sports",
+      conditionId: marketId,
+      endDate: market.closeTime || market.endDate || market.end_date_iso,
+      category: market.sport || "sports",
+      platform: market.platform,
     },
     currentOdds: { yes: odds.yes, no: odds.no },
     news: headlines,
@@ -332,9 +394,9 @@ async function analyzeMarket(market, forced = false) {
   if (!estimate) return null;
 
   // Record analysis state
-  state.analysisResults.set(condId, estimate);
-  state.lastAnalysisTime.set(condId, Date.now());
-  state.lastAnalysisPrice.set(condId, odds.yes);
+  state.analysisResults.set(marketId, estimate);
+  state.lastAnalysisTime.set(marketId, Date.now());
+  state.lastAnalysisPrice.set(marketId, odds.yes);
   state.stats.predictions++;
 
   // ── DECISION: Does this estimate warrant a trade? ──
