@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Poly-Agent Dashboard</title>
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --card: #13131a;
+      --border: #1e1e2e;
+      --text: #e0e0e8;
+      --muted: #6b6b80;
+      --accent: #6366f1;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --blue: #3b82f6;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+    .header h1 { font-size: 24px; font-weight: 600; }
+    .header .status { display: flex; align-items: center; gap: 8px; }
+    .header .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot.running { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.stopped { background: var(--red); }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+    .stat-card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    .section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    .section h2 { font-size: 16px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+    .section h2 .badge { background: var(--accent); color: white; font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+
+    .proposal { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    .proposal .market { font-weight: 600; margin-bottom: 8px; }
+    .proposal .details { display: flex; gap: 16px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+    .proposal .details span { display: flex; align-items: center; gap: 4px; }
+    .proposal .actions { margin-top: 12px; display: flex; gap: 8px; }
+    .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; }
+    .btn-approve { background: var(--green); color: white; }
+    .btn-reject { background: var(--border); color: var(--text); }
+    .btn-approve:hover { opacity: 0.9; }
+    .btn-control { background: var(--accent); color: white; padding: 6px 16px; }
+
+    .position { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--bg); border-radius: 8px; margin-bottom: 8px; }
+    .position .info { flex: 1; }
+    .position .pnl { font-weight: 700; font-size: 16px; }
+    .pnl.positive { color: var(--green); }
+    .pnl.negative { color: var(--red); }
+
+    .calibration-bar { display: flex; align-items: end; gap: 4px; height: 120px; margin-top: 12px; }
+    .cal-bucket { flex: 1; background: var(--accent); border-radius: 4px 4px 0 0; position: relative; min-height: 4px; opacity: 0.7; }
+    .cal-bucket:hover { opacity: 1; }
+    .cal-actual { position: absolute; bottom: 0; left: 50%; width: 2px; background: var(--green); transform: translateX(-50%); }
+    .cal-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    .empty { text-align: center; color: var(--muted); padding: 40px; font-size: 14px; }
+    .last-updated { text-align: right; font-size: 11px; color: var(--muted); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Poly-Agent</h1>
+    <div class="status">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Loading...</span>
+      <button class="btn btn-control" id="controlBtn" onclick="toggleAgent()">Start</button>
+    </div>
+  </div>
+
+  <div class="grid" id="statsGrid">
+    <div class="stat-card"><div class="label">Markets Watched</div><div class="value" id="s-markets">-</div></div>
+    <div class="stat-card"><div class="label">Predictions Made</div><div class="value" id="s-predictions">-</div></div>
+    <div class="stat-card"><div class="label">Open Positions</div><div class="value" id="s-positions">-</div></div>
+    <div class="stat-card"><div class="label">Proposals Pending</div><div class="value" id="s-proposals">-</div></div>
+    <div class="stat-card"><div class="label">Overreactions Found</div><div class="value" id="s-overreactions">-</div></div>
+    <div class="stat-card"><div class="label">Cycle Count</div><div class="value" id="s-cycles">-</div><div class="sub" id="s-lastUpdate">-</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Trade Proposals <span class="badge" id="proposalCount">0</span></h2>
+    <div id="proposalsList"><div class="empty">No pending proposals</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Open Positions</h2>
+    <div id="positionsList"><div class="empty">No open positions</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Calibration</h2>
+    <div id="calibrationSection"><div class="empty">No calibration data yet — predictions will appear here after markets resolve</div></div>
+  </div>
+
+  <div class="last-updated">Auto-refreshes every 5 seconds</div>
+
+  <script>
+    let agentRunning = false;
+
+    async function fetchState() {
+      try {
+        const resp = await fetch('/api/state');
+        const state = resp.ok ? await resp.json() : null;
+        if (!state) return;
+
+        agentRunning = state.running;
+        document.getElementById('statusDot').className = 'dot ' + (state.running ? 'running' : 'stopped');
+        document.getElementById('statusText').textContent = state.running ? 'Running' : 'Stopped';
+        document.getElementById('controlBtn').textContent = state.running ? 'Stop' : 'Start';
+
+        document.getElementById('s-markets').textContent = state.watchedMarkets || 0;
+        document.getElementById('s-predictions').textContent = state.stats?.predictions || 0;
+        document.getElementById('s-overreactions').textContent = state.stats?.overreactions || 0;
+        document.getElementById('s-cycles').textContent = state.cycleCount || 0;
+        document.getElementById('s-lastUpdate').textContent = state.lastFullAnalysis
+          ? `Last: ${new Date(state.lastFullAnalysis).toLocaleTimeString()}`
+          : 'Never';
+      } catch (e) { console.error('State fetch failed:', e); }
+    }
+
+    async function fetchProposals() {
+      try {
+        const resp = await fetch('/api/proposals');
+        const proposals = resp.ok ? await resp.json() : [];
+        const el = document.getElementById('proposalsList');
+        document.getElementById('proposalCount').textContent = proposals.length;
+        document.getElementById('s-proposals').textContent = proposals.length;
+
+        if (proposals.length === 0) {
+          el.innerHTML = '<div class="empty">No pending proposals</div>';
+          return;
+        }
+
+        el.innerHTML = proposals.map(p => `
+          <div class="proposal">
+            <div class="market">${p.market_question}</div>
+            <div class="details">
+              <span>Direction: <b>${p.direction}</b></span>
+              <span>Size: <b>$${Number(p.size_usd).toFixed(2)}</b></span>
+              <span>Edge: <b>${Number(p.edge_cents).toFixed(1)}¢</b></span>
+              <span>Confidence: <b>${(Number(p.confidence) * 100).toFixed(0)}%</b></span>
+              <span>Kelly: <b>${(Number(p.kelly_fraction) * 100).toFixed(1)}%</b></span>
+            </div>
+            <div style="margin-top:8px;font-size:13px;color:var(--muted)">${p.analysis_summary || ''}</div>
+            <div class="actions">
+              <button class="btn btn-approve" onclick="approve(${p.id})">Approve</button>
+              <button class="btn btn-reject" onclick="reject(${p.id})">Reject</button>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) { console.error('Proposals fetch failed:', e); }
+    }
+
+    async function fetchPositions() {
+      try {
+        const resp = await fetch('/api/positions');
+        const positions = resp.ok ? await resp.json() : [];
+        const el = document.getElementById('positionsList');
+        document.getElementById('s-positions').textContent = positions.length;
+
+        if (positions.length === 0) {
+          el.innerHTML = '<div class="empty">No open positions</div>';
+          return;
+        }
+
+        el.innerHTML = positions.map(p => `
+          <div class="position">
+            <div class="info">
+              <div style="font-weight:600">${p.market_question}</div>
+              <div style="font-size:13px;color:var(--muted);margin-top:4px">
+                ${p.direction} @ ${(Number(p.entry_price) * 100).toFixed(1)}¢ · $${Number(p.size_usd).toFixed(2)}
+              </div>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) { console.error('Positions fetch failed:', e); }
+    }
+
+    async function fetchCalibration() {
+      try {
+        const resp = await fetch('/api/calibration');
+        const cal = resp.ok ? await resp.json() : null;
+        if (!cal || !cal.buckets || cal.buckets.length === 0) return;
+
+        const el = document.getElementById('calibrationSection');
+        const brier = cal.overall?.brier_score;
+        const total = cal.overall?.total_predictions;
+
+        let html = `<div style="margin-bottom:12px">
+          <span style="font-size:14px">Brier Score: <b>${brier ? Number(brier).toFixed(4) : 'N/A'}</b></span>
+          <span style="margin-left:16px;font-size:13px;color:var(--muted)">(${total || 0} resolved predictions)</span>
+        </div>`;
+
+        html += '<div class="calibration-bar">';
+        for (const bucket of cal.buckets) {
+          const height = Math.max(4, bucket.count * 8);
+          const actualHeight = Math.max(4, Number(bucket.avg_actual) * 120);
+          html += `<div class="cal-bucket" style="height:${height}px" title="${(Number(bucket.bucket)*100).toFixed(0)}%: predicted ${(Number(bucket.avg_predicted)*100).toFixed(1)}%, actual ${(Number(bucket.avg_actual)*100).toFixed(1)}% (n=${bucket.count})">
+            <div class="cal-actual" style="height:${actualHeight}px"></div>
+          </div>`;
+        }
+        html += '</div>';
+        html += '<div class="cal-labels"><span>0%</span><span>50%</span><span>100%</span></div>';
+
+        el.innerHTML = html;
+      } catch (e) { console.error('Calibration fetch failed:', e); }
+    }
+
+    async function approve(id) {
+      await fetch(`/api/proposals/${id}/approve`, { method: 'POST' });
+      fetchProposals();
+      fetchPositions();
+    }
+
+    async function reject(id) {
+      await fetch(`/api/proposals/${id}/reject`, { method: 'POST' });
+      fetchProposals();
+    }
+
+    async function toggleAgent() {
+      const endpoint = agentRunning ? '/api/agent/stop' : '/api/agent/start';
+      await fetch(endpoint, { method: 'POST' });
+      setTimeout(fetchState, 500);
+    }
+
+    // Initial load + auto-refresh
+    function refresh() {
+      fetchState();
+      fetchProposals();
+      fetchPositions();
+      fetchCalibration();
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
