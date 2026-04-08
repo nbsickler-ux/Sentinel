@@ -89,6 +89,50 @@ app.get("/api/edges", async (_req, res) => {
   }
 });
 
+// ── MATCH RATE (how often Kalshi markets match to bookmaker events) ──
+
+app.get("/api/match-rate", async (_req, res) => {
+  try {
+    const state = getState();
+    const totalKalshi = state.watchedMarkets?.length || 0;
+    const totalBookmaker = state.bookmakerOdds?.length || 0;
+    const edges = state.detectedEdges || [];
+    const matchedMarkets = new Set(edges.map(e => e.marketId));
+
+    // Also pull historical match data from edges table
+    const { pool } = await import("./db/schema.js");
+    let historical = null;
+    if (pool) {
+      const { rows } = await pool.query(`
+        SELECT
+          DATE(created_at) as day,
+          COUNT(DISTINCT market_id) as unique_markets_matched,
+          COUNT(*) as total_edges_logged,
+          COUNT(*) FILTER (WHERE executed) as edges_traded,
+          ROUND(AVG(edge_cents)::numeric, 1) as avg_edge_cents,
+          MAX(edge_cents) as max_edge_cents
+        FROM poly_edges
+        GROUP BY DATE(created_at)
+        ORDER BY day DESC
+        LIMIT 14
+      `);
+      historical = rows;
+    }
+
+    res.json({
+      current: {
+        kalshiMarketsWatched: totalKalshi,
+        bookmakerEventsLoaded: totalBookmaker,
+        marketsWithEdge: matchedMarkets.size,
+        matchRate: totalKalshi > 0 ? `${((matchedMarkets.size / totalKalshi) * 100).toFixed(1)}%` : "0%",
+      },
+      historical,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── PERFORMANCE ──
 
 app.get("/api/performance", async (_req, res) => {
