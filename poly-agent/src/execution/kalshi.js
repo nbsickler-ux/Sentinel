@@ -48,13 +48,8 @@ function loadPrivateKey() {
   }
 
   if (privateKey) {
-    // Validate that the key can be parsed before claiming it's loaded
-    try {
-      crypto.createPrivateKey(privateKey);
-      logger.info({ module: "kalshi" }, "RSA private key loaded and validated — trading enabled");
-    } catch (err) {
-      logger.error({ module: "kalshi", err: err.message }, "Private key loaded but INVALID — cannot sign requests");
-    }
+    const hasPemHeader = privateKey.includes("-----BEGIN");
+    logger.info({ module: "kalshi", hasPemHeader, keyLen: privateKey.length }, "RSA private key loaded — trading enabled");
   } else {
     logger.warn({ module: "kalshi" }, "No private key — running in read-only mode");
   }
@@ -63,32 +58,38 @@ function loadPrivateKey() {
 }
 
 /**
- * Sign a request using RSA-PSS (Kalshi's auth method).
- * Headers: KALSHI-ACCESS-KEY, KALSHI-ACCESS-TIMESTAMP, KALSHI-ACCESS-SIGNATURE
+ * Sign a request using RSA-PSS — matches official @kalshi/sdk auth.ts exactly.
+ * Message = timestamp + METHOD + /trade-api/v2/path  (no query string, no body)
+ * Uses crypto.createSign('RSA-SHA256') with PSS padding.
  */
-function signRequest(method, path, body = "") {
+function signRequest(method, pathWithQuery) {
   const pem = loadPrivateKey();
   if (!pem || !apiKeyId) return {};
 
   try {
+    // Strip query string — Kalshi signs only the path portion
+    const pathOnly = pathWithQuery.split("?")[0];
+    // The SDK signs against the full API path: /trade-api/v2/...
+    const fullPath = `/trade-api/v2${pathOnly}`;
+
     const timestamp = Date.now().toString();
-    const message = timestamp + method.toUpperCase() + path + (body || "");
+    const msgString = timestamp + method.toUpperCase() + fullPath;
 
-    // Use crypto.createPrivateKey to handle both PKCS#1 and PKCS#8 formats
-    // This avoids "DECODER routines::unsupported" on Node 18+ / OpenSSL 3.x
-    const keyObject = crypto.createPrivateKey(pem);
+    // Exactly matches: crypto.createSign('RSA-SHA256') from @kalshi/sdk auth.ts
+    const sign = crypto.createSign("RSA-SHA256");
+    sign.update(msgString);
+    sign.end();
 
-    const signature = crypto.sign("sha256", Buffer.from(message), {
-      key: keyObject,
+    const signature = sign.sign({
+      key: pem,
       padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
       saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
     });
 
     return {
       "KALSHI-ACCESS-KEY": apiKeyId,
-      "KALSHI-ACCESS-TIMESTAMP": timestamp,
       "KALSHI-ACCESS-SIGNATURE": signature.toString("base64"),
-      "Content-Type": "application/json",
+      "KALSHI-ACCESS-TIMESTAMP": timestamp,
     };
   } catch (err) {
     logger.error({ module: "kalshi", err: err.message }, "Failed to sign request — check private key format");
@@ -101,8 +102,10 @@ function signRequest(method, path, body = "") {
  */
 async function kalshiRequest(method, path, data = null) {
   const url = `${baseUrl}${path}`;
-  const body = data ? JSON.stringify(data) : "";
-  const headers = signRequest(method, path, body);
+  const headers = {
+    ...signRequest(method, path),
+    "Content-Type": "application/json",
+  };
 
   try {
     const resp = await axios({
