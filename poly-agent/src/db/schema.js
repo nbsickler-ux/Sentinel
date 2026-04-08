@@ -123,6 +123,22 @@ export async function initializeDatabase() {
         captured_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      -- Cross-platform edge detection log (v3 math-based)
+      CREATE TABLE IF NOT EXISTS poly_edges (
+        id SERIAL PRIMARY KEY,
+        market_id TEXT NOT NULL,
+        ticker TEXT,
+        side TEXT NOT NULL,           -- yes or no
+        kalshi_price REAL NOT NULL,
+        fair_value REAL NOT NULL,     -- bookmaker consensus implied prob
+        edge_cents REAL NOT NULL,     -- after fees
+        sharp_book TEXT,              -- which sharp book provided the anchor
+        bookmaker_count INTEGER,
+        executed BOOLEAN DEFAULT FALSE,
+        mode TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       -- Indexes for fast queries
       CREATE INDEX IF NOT EXISTS idx_predictions_condition ON poly_predictions(condition_id);
       CREATE INDEX IF NOT EXISTS idx_predictions_resolved ON poly_predictions(actual_outcome) WHERE actual_outcome IS NOT NULL;
@@ -130,6 +146,8 @@ export async function initializeDatabase() {
       CREATE INDEX IF NOT EXISTS idx_positions_closed ON poly_positions(closed_at);
       CREATE INDEX IF NOT EXISTS idx_proposals_status ON poly_proposals(status);
       CREATE INDEX IF NOT EXISTS idx_odds_condition ON poly_odds_history(condition_id, captured_at);
+      CREATE INDEX IF NOT EXISTS idx_edges_created ON poly_edges(created_at);
+      CREATE INDEX IF NOT EXISTS idx_edges_market ON poly_edges(market_id);
     `);
 
     logger.info({ module: "db" }, "Database schema initialized");

@@ -79,6 +79,16 @@ export default {
     token: process.env.UPSTASH_REDIS_REST_TOKEN || "",
   },
 
+  // ── Bookmaker Odds (cross-platform comparison) ──
+  bookmaker: {
+    // The Odds API (primary)
+    oddsApiKey: process.env.ODDS_API_KEY || "",
+    // Poll frequency — match Kalshi scan rate for real-time comparison
+    pollMs: parseInt(process.env.BOOKMAKER_POLL_MS || "60000", 10),  // 60s default
+    // Minimum number of bookmakers required for consensus
+    minBookmakers: parseInt(process.env.BOOKMAKER_MIN_BOOKS || "3", 10),
+  },
+
   // ═══════════════════════════════════════════════
   // OPERATING MODE
   // ═══════════════════════════════════════════════

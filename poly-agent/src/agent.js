@@ -1,62 +1,55 @@
 // ============================================================
-// POLY-AGENT: MAIN ORCHESTRATOR (v2 — Event-Driven)
+// POLY-AGENT: MAIN ORCHESTRATOR (v3 — Math-Based Edge Detection)
+//
+// Architecture:
+//   Two parallel data streams:
+//     1. Kalshi prices (every 30s) — what the prediction market thinks
+//     2. Bookmaker odds (every 60s) — what sharp money thinks (= fair value)
+//   Edge = bookmaker implied probability − Kalshi price − fees
+//   No LLM in the hot path. Pure math. Milliseconds per cycle.
 //
 // Three operating modes:
-//   "analysis"   — Predict + log everything, execute nothing
-//   "guarded"    — Auto-execute within tight guardrails
+//   "analysis"    — Detect edges + log, execute nothing
+//   "guarded"     — Auto-execute within tight guardrails
 //   "autonomous"  — Full auto, circuit breaker is the only gate
 //
-// Analysis triggers (replaces fixed 5-min intervals):
-//   - Price move > 3¢ since last analysis
-//   - High-impact news/injury detected
-//   - Approaching game time (pre-game window)
-//   - Stale analysis (>30 min with no trigger)
-//
-// Position management:
-//   - Profit target: +8¢ move in our favor → exit
-//   - Edge compressed: remaining edge < 2¢ → exit
-//   - Stop loss: -12¢ against → exit
-//   - Analysis reversal: Claude flips direction → exit
+// Daily brief (separate from hot path):
+//   Claude reviews yesterday's trades, edge quality, P&L — that's
+//   where human + AI analysis happens, not per-market per-cycle.
 // ============================================================
 
 import config from "./config.js";
 import logger from "./logger.js";
-import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
 import * as kalshi from "./execution/kalshi.js";
-import { fetchAllNews } from "./ingest/news.js";
-import {
-  estimateFairValue,
-  detectOverreaction,
-  findCorrelatedMarkets,
-  scoreNewsRelevance,
-} from "./analysis/engine.js";
+import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
+import { fetchAllOdds } from "./execution/bookmaker.js";
+import { findEdges, evaluateExits as evaluateEdgeExits } from "./analysis/edge.js";
 import { checkCircuitBreaker } from "./risk/circuit-breaker.js";
-import { createProposal, getPendingProposals, approveProposal } from "./execution/manager.js";
-import { evaluateExits, getPerformanceSummary } from "./execution/positions.js";
+import { createProposal, approveProposal } from "./execution/manager.js";
+import { evaluateExits as evaluatePositionExits } from "./execution/positions.js";
 import { pool } from "./db/schema.js";
 
 // ── STATE ──
 
 const state = {
   watchedMarkets: [],
-  latestNews: null,
-  latestOdds: new Map(),         // marketId → { yes, no, timestamp }
-  previousOdds: new Map(),       // marketId → previous snapshot
-  analysisResults: new Map(),    // marketId → latest fair value estimate
-  lastAnalysisTime: new Map(),   // marketId → timestamp of last analysis
-  lastAnalysisPrice: new Map(),  // marketId → price at time of last analysis
-  cycleCount: 0,
-  lastNewsScan: 0,
+  latestOdds: new Map(),           // marketId → { yes, no, timestamp }
+  bookmakerOdds: [],               // latest bookmaker events from The Odds API
+  lastBookmakerPoll: 0,
   lastOddsScan: 0,
+  detectedEdges: [],               // current edges found this cycle
+  tradeLog: [],                    // trades executed today (for daily brief)
+  cycleCount: 0,
   running: false,
   stats: {
-    predictions: 0,
+    edgesDetected: 0,
+    edgesActedOn: 0,
     proposals: 0,
     autoExecuted: 0,
-    overreactions: 0,
-    correlations: 0,
-    skippedNoTrigger: 0,
-    totalCostUsd: 0,
+    marketsMatched: 0,             // Kalshi markets matched to bookmaker events
+    skippedNoMatch: 0,             // Kalshi markets with no bookmaker equivalent
+    bookmakerPolls: 0,
+    kalshiPolls: 0,
   },
 };
 
@@ -68,7 +61,6 @@ async function discoverMarkets() {
   // ── Kalshi discovery ──
   if (config.platforms?.kalshi?.enabled) {
     try {
-      // Fetch all open markets in one call (no server-side category filter)
       const markets = await kalshi.getMarkets({ status: "open", limit: 200 });
       for (const m of markets) {
         allMarkets.push({
@@ -77,7 +69,6 @@ async function discoverMarkets() {
           platform: "kalshi",
           sport: m.category || "unknown",
           active: m.status === "open" || m.status === "active",
-          // Normalize pricing: Kalshi prices may be in cents (0-100) or decimal (0-1)
           lastYesPrice: m.yes_ask != null ? (m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask) : (m.last_price != null ? (m.last_price > 1 ? m.last_price / 100 : m.last_price) : 0.5),
           lastNoPrice: m.no_ask != null ? (m.no_ask > 1 ? m.no_ask / 100 : m.no_ask) : 0.5,
           ticker: m.ticker,
@@ -139,158 +130,39 @@ async function discoverMarkets() {
   return state.watchedMarkets;
 }
 
-// ── TRIGGER LOGIC ──
+// ── BOOKMAKER ODDS POLLING ──
 
-/**
- * Determine if a market needs re-analysis based on event triggers.
- * Returns { shouldAnalyze, reason } — saves API calls by skipping
- * markets where nothing has changed.
- */
-function shouldAnalyzeMarket(conditionId, currentPrice) {
+async function bookmakerPollCycle() {
   const now = Date.now();
-  const lastTime = state.lastAnalysisTime.get(conditionId) || 0;
-  const lastPrice = state.lastAnalysisPrice.get(conditionId);
-  const timeSinceAnalysis = now - lastTime;
+  const pollMs = config.bookmaker?.pollMs || 60_000;
+  if (now - state.lastBookmakerPoll < pollMs) return;
+  state.lastBookmakerPoll = now;
 
-  // Never analyzed → always analyze
-  if (!lastTime) {
-    return { shouldAnalyze: true, reason: "first_analysis" };
-  }
+  try {
+    const events = await fetchAllOdds();
+    state.bookmakerOdds = events;
+    state.stats.bookmakerPolls++;
 
-  // Find the market for game-time proximity check
-  const market = state.watchedMarkets.find((m) => m.id === conditionId);
-  const endDate = market?.closeTime || market?.endDate || market?.end_date_iso;
-  const hoursToResolution = endDate
-    ? (new Date(endDate).getTime() - now) / (1000 * 60 * 60)
-    : Infinity;
-
-  // Pre-game window: more sensitive trigger
-  const inPreGame = hoursToResolution <= config.triggers.preGameWindowHours && hoursToResolution > 0;
-  const triggerCents = inPreGame
-    ? config.triggers.preGameTriggerCents
-    : config.triggers.priceMoveTriggerCents;
-
-  // Price move trigger
-  if (lastPrice != null && currentPrice != null) {
-    const moveCents = Math.abs(currentPrice - lastPrice) * 100;
-    if (moveCents >= triggerCents) {
-      return {
-        shouldAnalyze: true,
-        reason: inPreGame
-          ? `pre_game_move_${moveCents.toFixed(1)}c`
-          : `price_move_${moveCents.toFixed(1)}c`,
-      };
-    }
-  }
-
-  // Stale analysis
-  if (timeSinceAnalysis >= config.triggers.staleAnalysisMs) {
-    return { shouldAnalyze: true, reason: "stale" };
-  }
-
-  return { shouldAnalyze: false, reason: "no_trigger" };
-}
-
-// ── NEWS SCAN ──
-
-async function newsScanCycle() {
-  const now = Date.now();
-  if (now - state.lastNewsScan < config.triggers.newsPollMs) return;
-  state.lastNewsScan = now;
-
-  const news = await fetchAllNews(["nba", "mlb", "nhl"]);
-  state.latestNews = news;
-
-  // Filter headlines for relevance (limit to control API cost)
-  const toCheck = news.headlines.slice(0, 10);
-  const relevantNews = [];
-
-  for (const headline of toCheck) {
-    const relevance = await scoreNewsRelevance({
-      newsItem: headline,
-      watchedMarkets: state.watchedMarkets.slice(0, 15),
-    });
-    if (relevance?.relevant && relevance.impact_magnitude !== "none") {
-      relevantNews.push({ headline, relevance });
-    }
-  }
-
-  // High-impact news → trigger correlation + immediate analysis
-  for (const { headline, relevance } of relevantNews) {
-    if (relevance.impact_magnitude === "high") {
-      await handleHighImpactEvent(headline);
-    }
-  }
-
-  // Critical injuries → same treatment
-  for (const injury of news.injuries) {
-    if (injury.status === "Out" || injury.status === "Doubtful") {
-      const event = {
-        title: `${injury.player} (${injury.team}) ruled ${injury.status}`,
-        description: injury.detail || injury.type,
-        detail: `Game: ${injury.event}, Date: ${injury.gameDate}`,
-      };
-      await handleHighImpactEvent(event);
-    }
-  }
-
-  logger.info({
-    module: "agent",
-    headlines: news.headlines.length,
-    injuries: news.injuries.length,
-    relevant: relevantNews.length,
-  }, "News scan complete");
-}
-
-/**
- * Handle a high-impact news event: find all affected markets,
- * trigger immediate re-analysis on each.
- */
-async function handleHighImpactEvent(newsEvent) {
-  logger.info({
-    module: "agent",
-    event: newsEvent.title?.slice(0, 80),
-  }, "High-impact event — running correlation analysis");
-
-  const correlated = await findCorrelatedMarkets({
-    newsEvent,
-    activeMarkets: state.watchedMarkets.slice(0, 25).map((m) => ({
-      conditionId: m.id,
-      question: m.question,
-      yesPrice: m.lastYesPrice || 0.5,
-    })),
-  });
-
-  state.stats.correlations++;
-
-  if (correlated?.affected_markets?.length > 0) {
     logger.info({
       module: "agent",
-      affected: correlated.affected_markets.length,
-      urgency: correlated.urgency,
-    }, "Correlated markets identified — triggering analysis");
-
-    for (const affected of correlated.affected_markets) {
-      const market = state.watchedMarkets.find(
-        (m) => m.id?.startsWith(affected.condition_id)
-      );
-      if (market) {
-        // Force analysis regardless of trigger (this IS the trigger)
-        await analyzeMarket(market, true);
-      }
-    }
+      events: events.length,
+      sports: [...new Set(events.map(e => e.sport))].join(","),
+    }, "Bookmaker odds updated");
+  } catch (err) {
+    logger.error({ module: "agent", err: err.message }, "Bookmaker poll failed");
   }
 }
 
-// ── ODDS SCAN + EXIT EVALUATION ──
+// ── KALSHI ODDS SCAN + EDGE DETECTION ──
 
 async function oddsScanCycle() {
   const now = Date.now();
   if (now - state.lastOddsScan < config.triggers.oddsPollMs) return;
   state.lastOddsScan = now;
+  state.stats.kalshiPolls++;
 
   // Update prices on watched markets
-  for (const market of state.watchedMarkets.slice(0, 20)) {
+  for (const market of state.watchedMarkets.slice(0, 50)) {
     const marketId = market.id;
     let price;
     try {
@@ -304,9 +176,11 @@ async function oddsScanCycle() {
     }
     if (!price || price.yes == null) continue;
 
-    const prev = state.latestOdds.get(marketId);
-    if (prev) state.previousOdds.set(marketId, prev);
-    state.latestOdds.set(marketId, price);
+    state.latestOdds.set(marketId, { ...price, timestamp: now });
+
+    // Update the market object with latest prices for edge matching
+    market.lastYesPrice = price.yes;
+    market.lastNoPrice = price.no;
 
     // Record to DB (non-blocking)
     if (pool) {
@@ -316,166 +190,143 @@ async function oddsScanCycle() {
         [marketId, price.yes, price.no]
       ).catch(() => {});
     }
+  }
 
-    // Check for significant moves → overreaction detection
-    if (prev) {
-      const moveCents = Math.abs(price.yes - prev.yes) * 100;
-      if (moveCents > 5) {
-        const minutesSince = (now - prev.timestamp) / 60_000;
-        const overreaction = await detectOverreaction({
-          market: { question: market.question, conditionId: marketId },
-          priceBefore: prev.yes,
-          priceNow: price.yes,
-          minutesSinceMove: Math.round(minutesSince),
-          newsContent: state.latestNews?.headlines?.[0]?.title || null,
-        });
+  // ── EDGE DETECTION: Pure math comparison ──
+  if (state.bookmakerOdds.length > 0) {
+    const edges = findEdges(state.watchedMarkets, state.bookmakerOdds);
+    state.detectedEdges = edges;
 
-        if (overreaction?.reversion_expected) {
-          state.stats.overreactions++;
-          logger.info({
-            module: "agent",
-            market: market.question?.slice(0, 60),
-            assessment: overreaction.assessment,
-            reversion: `${overreaction.reversion_magnitude_cents}¢`,
-          }, "Overreaction detected");
-          await analyzeMarket(market, true); // Force analysis
-        }
+    if (edges.length > 0) {
+      state.stats.edgesDetected += edges.length;
+      logger.info({
+        module: "agent",
+        edges: edges.length,
+        topEdge: `${edges[0].ticker} ${edges[0].side} ${edges[0].edgeCents}¢`,
+        topFairValue: edges[0].fairValue?.toFixed(3),
+        topKalshiPrice: edges[0].kalshiPrice?.toFixed(3),
+      }, "Edges detected");
+
+      // Act on edges
+      for (const edge of edges) {
+        await actOnEdge(edge);
       }
-    }
-
-    // EVENT-DRIVEN: Check if this market needs re-analysis
-    const trigger = shouldAnalyzeMarket(marketId, price.yes);
-    if (trigger.shouldAnalyze) {
-      await analyzeMarket(market, false);
-    } else {
-      state.stats.skippedNoTrigger++;
     }
   }
 
   // ── EVALUATE EXITS on open positions ──
-  await evaluateExits(state.latestOdds, state.analysisResults);
+  try {
+    await evaluatePositionExits(state.latestOdds, new Map()); // No analysis results needed
+  } catch (err) {
+    // Positions module might not have open positions yet
+  }
 }
 
-// ── MARKET ANALYSIS ──
+// ── EDGE EXECUTION ──
 
-/**
- * Run Claude analysis on a single market.
- * Creates proposals or auto-executes depending on operating mode.
- */
-async function analyzeMarket(market, forced = false) {
-  const marketId = market.id;
-  const odds = state.latestOdds.get(marketId);
-  if (!odds) return null;
-
-  // Build context
-  const headlines = (state.latestNews?.headlines || []).slice(0, 5);
-  const injuries = (state.latestNews?.injuries || []).filter((i) => {
-    const q = (market.question || "").toLowerCase();
-    return q.includes((i.team || "").toLowerCase()) || q.includes((i.player || "").toLowerCase());
-  });
-
-  const estimate = await estimateFairValue({
-    market: {
-      question: market.question,
-      conditionId: marketId,
-      endDate: market.closeTime || market.endDate || market.end_date_iso,
-      category: market.sport || "sports",
-      platform: market.platform,
-    },
-    currentOdds: { yes: odds.yes, no: odds.no },
-    news: headlines,
-    injuries,
-    scoreboard: null,
-  });
-
-  if (!estimate) return null;
-
-  // Record analysis state
-  state.analysisResults.set(marketId, estimate);
-  state.lastAnalysisTime.set(marketId, Date.now());
-  state.lastAnalysisPrice.set(marketId, odds.yes);
-  state.stats.predictions++;
-
-  // ── DECISION: Does this estimate warrant a trade? ──
-  const hasEdge =
-    estimate.direction !== "no_trade" &&
-    Math.abs(estimate.edge_vs_market) >= config.risk.minEdgeCents;
-
-  if (!hasEdge) return estimate;
-
+async function actOnEdge(edge) {
   const breaker = await checkCircuitBreaker();
   if (!breaker.allowed) {
-    logger.warn({ module: "agent", reason: breaker.reason }, "Circuit breaker blocked");
-    return estimate;
+    logger.warn({ module: "agent", reason: breaker.reason, market: edge.ticker }, "Circuit breaker blocked");
+    return;
   }
 
-  const bankroll = breaker.details.current_bankroll || 1000;
-  const proposal = await createProposal(estimate, bankroll, breaker.details.size_multiplier);
-  if (!proposal) return estimate;
+  const bankroll = breaker.details?.current_bankroll || 1000;
+
+  // Build a proposal-compatible object from the edge
+  const proposalData = {
+    direction: edge.side === "yes" ? "buy_yes" : "buy_no",
+    edge_vs_market: edge.edgeCents,
+    fair_value: edge.fairValue,
+    confidence: Math.min(0.9, 0.5 + (edge.bookmakerCount / 20)), // More bookmakers = more confidence
+    market_price: edge.kalshiPrice,
+    reasoning: `Cross-platform edge: ${edge.sharpBook} implies ${(edge.fairValue * 100).toFixed(1)}% vs Kalshi ${(edge.kalshiPrice * 100).toFixed(1)}% (${edge.bookmakerCount} books, ${edge.edgeCents}¢ after fees)`,
+    condition_id: edge.marketId,
+  };
+
+  const proposal = await createProposal(proposalData, bankroll, breaker.details?.size_multiplier || 1);
+  if (!proposal) return;
 
   state.stats.proposals++;
+  state.stats.edgesActedOn++;
 
-  // ── OPERATING MODE DETERMINES WHAT HAPPENS NEXT ──
-
+  // ── OPERATING MODE ──
   if (config.mode === "analysis") {
-    // Analysis mode: log proposal, don't execute
     logger.info({
       module: "agent",
       mode: "analysis",
-      market: market.question?.slice(0, 60),
-      direction: estimate.direction,
-      edge: `${estimate.edge_vs_market.toFixed(1)}¢`,
-      size: `$${proposal.size_usd}`,
-    }, "Proposal logged (analysis mode — no execution)");
+      market: edge.ticker,
+      side: edge.side,
+      edge: `${edge.edgeCents}¢`,
+      fairValue: edge.fairValue?.toFixed(3),
+      kalshiPrice: edge.kalshiPrice?.toFixed(3),
+      sharpBook: edge.sharpBook,
+      books: edge.bookmakerCount,
+    }, "Edge logged (analysis mode — no execution)");
+
+    // Log to trade log for daily brief
+    state.tradeLog.push({
+      timestamp: Date.now(),
+      type: "edge_detected",
+      ...edge,
+      executed: false,
+    });
 
   } else if (config.mode === "guarded") {
-    // Guarded mode: auto-execute if within guardrails
     const { maxSizeUsd, minEdgeCents, minConfidence } = config.autoExec;
-
     const withinGuardrails =
       proposal.size_usd <= maxSizeUsd &&
-      proposal.edge_cents >= minEdgeCents &&
-      proposal.confidence >= minConfidence;
+      edge.edgeCents >= minEdgeCents &&
+      proposalData.confidence >= minConfidence;
 
     if (withinGuardrails) {
       const result = await approveProposal(proposal.id);
-      if (result.success) {
+      if (result?.success) {
         state.stats.autoExecuted++;
+        state.tradeLog.push({ timestamp: Date.now(), type: "executed", ...edge, executed: true });
         logger.info({
           module: "agent",
           mode: "guarded",
-          market: market.question?.slice(0, 60),
+          market: edge.ticker,
+          side: edge.side,
+          edge: `${edge.edgeCents}¢`,
           size: `$${proposal.size_usd}`,
-          edge: `${proposal.edge_cents.toFixed(1)}¢`,
         }, "Auto-executed (within guardrails)");
       }
     } else {
       logger.info({
         module: "agent",
         mode: "guarded",
-        market: market.question?.slice(0, 60),
+        market: edge.ticker,
         reason: proposal.size_usd > maxSizeUsd ? "size_exceeds_limit"
-          : proposal.edge_cents < minEdgeCents ? "edge_below_threshold"
+          : edge.edgeCents < minEdgeCents ? "edge_below_threshold"
           : "confidence_below_threshold",
-      }, "Proposal held for review (outside guardrails)");
+      }, "Edge held (outside guardrails)");
     }
 
   } else if (config.mode === "autonomous") {
-    // Autonomous: execute everything the circuit breaker allows
     const result = await approveProposal(proposal.id);
-    if (result.success) {
+    if (result?.success) {
       state.stats.autoExecuted++;
+      state.tradeLog.push({ timestamp: Date.now(), type: "executed", ...edge, executed: true });
       logger.info({
         module: "agent",
         mode: "autonomous",
-        market: market.question?.slice(0, 60),
+        market: edge.ticker,
+        edge: `${edge.edgeCents}¢`,
         size: `$${proposal.size_usd}`,
-        edge: `${proposal.edge_cents.toFixed(1)}¢`,
       }, "Auto-executed (autonomous)");
     }
   }
 
-  return estimate;
+  // Record edge to DB for daily brief analysis
+  if (pool) {
+    pool.query(
+      `INSERT INTO poly_edges (market_id, ticker, side, kalshi_price, fair_value, edge_cents, sharp_book, bookmaker_count, executed, mode)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [edge.marketId, edge.ticker, edge.side, edge.kalshiPrice, edge.fairValue, edge.edgeCents, edge.sharpBook, edge.bookmakerCount, config.mode !== "analysis", config.mode]
+    ).catch(() => {});
+  }
 }
 
 // ── MAIN LOOP ──
@@ -483,9 +334,9 @@ async function analyzeMarket(market, forced = false) {
 async function tick() {
   state.cycleCount++;
   try {
-    await newsScanCycle();
+    // Two parallel streams: bookmaker odds + Kalshi prices
+    await bookmakerPollCycle();
     await oddsScanCycle();
-    // No more fixed fullAnalysisCycle — analysis is event-driven from oddsScanCycle
   } catch (err) {
     logger.error({ module: "agent", err: err.message }, "Tick error");
   }
@@ -495,12 +346,19 @@ export async function startAgent() {
   if (state.running) return;
   state.running = true;
 
+  const hasOddsApi = !!config.bookmaker?.oddsApiKey;
+
   logger.info({
     module: "agent",
     mode: config.mode,
+    bookmakerEnabled: hasOddsApi,
     exitRules: config.exits,
     triggers: config.triggers,
-  }, "Poly-Agent starting...");
+  }, "Poly-Agent v3 starting (math-based edge detection)...");
+
+  if (!hasOddsApi) {
+    logger.warn({ module: "agent" }, "No ODDS_API_KEY — running Kalshi-only without cross-platform comparison. Add ODDS_API_KEY for bookmaker edge detection.");
+  }
 
   await discoverMarkets();
   setInterval(discoverMarkets, 30 * 60 * 1000);
@@ -529,14 +387,28 @@ export function getState() {
     cycleCount: state.cycleCount,
     watchedMarkets: state.watchedMarkets.length,
     latestOdds: Object.fromEntries(state.latestOdds),
-    analysisResults: Object.fromEntries(state.analysisResults),
+    bookmakerEvents: state.bookmakerOdds.length,
+    detectedEdges: state.detectedEdges.slice(0, 10), // top 10 for dashboard
     stats: state.stats,
-    lastNewsScan: state.lastNewsScan,
     lastOddsScan: state.lastOddsScan,
-    newsCount: state.latestNews?.headlines?.length || 0,
-    injuryCount: state.latestNews?.injuries?.length || 0,
+    lastBookmakerPoll: state.lastBookmakerPoll,
     exitRules: config.exits,
     autoExec: config.autoExec,
-    triggers: config.triggers,
+    tradeLogToday: state.tradeLog.length,
+  };
+}
+
+/**
+ * Get today's trade log for daily brief generation.
+ */
+export function getDailyBriefData() {
+  return {
+    date: new Date().toISOString().split("T")[0],
+    mode: config.mode,
+    stats: { ...state.stats },
+    edges: [...state.detectedEdges],
+    tradeLog: [...state.tradeLog],
+    watchedMarkets: state.watchedMarkets.length,
+    bookmakerEvents: state.bookmakerOdds.length,
   };
 }
