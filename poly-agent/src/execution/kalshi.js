@@ -51,27 +51,33 @@ function loadPrivateKey() {
  * Headers: KALSHI-ACCESS-KEY, KALSHI-ACCESS-TIMESTAMP, KALSHI-ACCESS-SIGNATURE
  */
 function signRequest(method, path, body = "") {
-  const key = loadPrivateKey();
-  if (!key || !apiKeyId) return {};
+  const pem = loadPrivateKey();
+  if (!pem || !apiKeyId) return {};
 
-  const timestamp = Date.now().toString();
-  const message = timestamp + method.toUpperCase() + path + (body || "");
+  try {
+    const timestamp = Date.now().toString();
+    const message = timestamp + method.toUpperCase() + path + (body || "");
 
-  const sign = crypto.createSign("RSA-SHA256");
-  sign.update(message);
-  sign.end();
+    // Use crypto.createPrivateKey to handle both PKCS#1 and PKCS#8 formats
+    // This avoids "DECODER routines::unsupported" on Node 18+ / OpenSSL 3.x
+    const keyObject = crypto.createPrivateKey(pem);
 
-  const signature = sign.sign(
-    { key, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST },
-    "base64"
-  );
+    const signature = crypto.sign("sha256", Buffer.from(message), {
+      key: keyObject,
+      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+    });
 
-  return {
-    "KALSHI-ACCESS-KEY": apiKeyId,
-    "KALSHI-ACCESS-TIMESTAMP": timestamp,
-    "KALSHI-ACCESS-SIGNATURE": signature,
-    "Content-Type": "application/json",
-  };
+    return {
+      "KALSHI-ACCESS-KEY": apiKeyId,
+      "KALSHI-ACCESS-TIMESTAMP": timestamp,
+      "KALSHI-ACCESS-SIGNATURE": signature.toString("base64"),
+      "Content-Type": "application/json",
+    };
+  } catch (err) {
+    logger.error({ module: "kalshi", err: err.message }, "Failed to sign request — check private key format");
+    return {};
+  }
 }
 
 /**
