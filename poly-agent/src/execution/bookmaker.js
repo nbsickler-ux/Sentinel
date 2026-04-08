@@ -34,11 +34,12 @@ export async function fetchOdds(sportKey) {
   }
 
   try {
-    const resp = await axios.get(`${ODDS_API_BASE}/sports/${sportKey}/odds`, {
+    const resp = await axios.get(`${ODDS_API_BASE}/odds`, {
       params: {
         apiKey,
-        regions: "us,us2",
-        markets: "h2h",
+        sport: sportKey,
+        region: "us",
+        mkt: "h2h",
         oddsFormat: "decimal",
       },
       timeout: 10_000,
