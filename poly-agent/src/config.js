@@ -9,20 +9,6 @@ dotenv.config({ path: "/etc/secrets/.env" });
 dotenv.config({ path: resolve(__dirname, "../../.env") });
 
 export default {
-  // ── Claude API ──
-  anthropic: {
-    apiKey: process.env.ANTHROPIC_API_KEY || "",
-    maxTokens: 1500,
-  },
-
-  // ── Model routing: Haiku for volume, Sonnet for reasoning ──
-  models: {
-    fairValue:     process.env.POLY_FAIR_VALUE_MODEL     || "claude-haiku-4-5-20251001",
-    overreaction:  process.env.POLY_OVERREACTION_MODEL    || "claude-sonnet-4-20250514",
-    correlation:   process.env.POLY_CORRELATION_MODEL     || "claude-sonnet-4-20250514",
-    newsRelevance: process.env.POLY_NEWS_RELEVANCE_MODEL  || "claude-haiku-4-5-20251001",
-  },
-
   // ── Platforms ──
   // Both platforms run in parallel. Agent finds best price across both.
   platforms: {

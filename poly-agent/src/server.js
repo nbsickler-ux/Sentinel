@@ -18,7 +18,6 @@ import {
   rejectProposal,
   getOpenPositions,
 } from "./execution/manager.js";
-import { getCalibrationStats } from "./analysis/engine.js";
 import { getPerformanceSummary } from "./execution/positions.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -75,11 +74,19 @@ app.get("/api/positions", async (_req, res) => {
   res.json(positions);
 });
 
-// ── CALIBRATION ──
+// ── EDGES (recent detections) ──
 
-app.get("/api/calibration", async (_req, res) => {
-  const stats = await getCalibrationStats();
-  res.json(stats || { message: "No calibration data yet" });
+app.get("/api/edges", async (_req, res) => {
+  try {
+    const { pool } = await import("./db/schema.js");
+    if (!pool) return res.json({ edges: [] });
+    const { rows } = await pool.query(
+      `SELECT * FROM poly_edges ORDER BY created_at DESC LIMIT 50`
+    );
+    res.json({ edges: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── PERFORMANCE ──
