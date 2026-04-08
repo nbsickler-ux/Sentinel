@@ -29,7 +29,16 @@ function loadPrivateKey() {
 
   if (kalshiConfig.privateKeyPem) {
     // .env files often store multi-line PEM keys with literal \n instead of real newlines
-    privateKey = kalshiConfig.privateKeyPem.replace(/\\n/g, "\n");
+    let raw = kalshiConfig.privateKeyPem;
+    raw = raw.replace(/\\n/g, "\n");
+
+    // Log diagnostics (first/last chars, newline count — NO key material)
+    const newlineCount = (raw.match(/\n/g) || []).length;
+    const starts = raw.substring(0, 35);
+    const ends = raw.substring(raw.length - 35);
+    logger.info({ module: "kalshi", starts, ends, newlineCount, totalLen: raw.length }, "Private key diagnostics");
+
+    privateKey = raw;
   } else if (kalshiConfig.privateKeyPath) {
     try {
       privateKey = fs.readFileSync(kalshiConfig.privateKeyPath, "utf-8");
@@ -39,7 +48,13 @@ function loadPrivateKey() {
   }
 
   if (privateKey) {
-    logger.info({ module: "kalshi" }, "RSA private key loaded — trading enabled");
+    // Validate that the key can be parsed before claiming it's loaded
+    try {
+      crypto.createPrivateKey(privateKey);
+      logger.info({ module: "kalshi" }, "RSA private key loaded and validated — trading enabled");
+    } catch (err) {
+      logger.error({ module: "kalshi", err: err.message }, "Private key loaded but INVALID — cannot sign requests");
+    }
   } else {
     logger.warn({ module: "kalshi" }, "No private key — running in read-only mode");
   }
