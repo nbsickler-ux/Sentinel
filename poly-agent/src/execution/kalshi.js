@@ -28,7 +28,8 @@ function loadPrivateKey() {
   if (privateKey) return privateKey;
 
   if (kalshiConfig.privateKeyPem) {
-    privateKey = kalshiConfig.privateKeyPem;
+    // .env files often store multi-line PEM keys with literal \n instead of real newlines
+    privateKey = kalshiConfig.privateKeyPem.replace(/\\n/g, "\n");
   } else if (kalshiConfig.privateKeyPath) {
     try {
       privateKey = fs.readFileSync(kalshiConfig.privateKeyPath, "utf-8");
