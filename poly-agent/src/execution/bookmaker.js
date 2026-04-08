@@ -1,15 +1,15 @@
 // bookmaker.js — Fetches bookmaker odds for cross-platform comparison
-// Uses The Odds API v4 (free tier: 500 requests/month, paid: more)
-// Falls back to Odds-API.io if configured
+// Uses Odds-API.io (free tier: 100 requests/hour, no monthly cap)
+// Docs: https://docs.odds-api.io
 
 import axios from "axios";
 import logger from "../logger.js";
 import config from "../config.js";
 
-const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
+const ODDS_API_BASE = "https://api.odds-api.io/v3";
 const apiKey = process.env.ODDS_API_KEY || "";
 
-// Map Kalshi sport categories to The Odds API sport keys
+// Map Kalshi sport categories to API sport keys
 const SPORT_MAP = {
   nba: "basketball_nba",
   nfl: "americanfootball_nfl",
@@ -24,7 +24,7 @@ const SPORT_MAP = {
 const SHARP_BOOKS = ["pinnacle", "betonlineag", "bovada", "fanduel", "draftkings", "betmgm"];
 
 /**
- * Fetch odds for a sport from The Odds API.
+ * Fetch odds for a sport from Odds-API.io.
  * Returns normalized array of events with implied probabilities.
  */
 export async function fetchOdds(sportKey) {
@@ -77,7 +77,7 @@ export async function fetchAllOdds() {
 }
 
 /**
- * Normalize an Odds API event into our comparison format.
+ * Normalize an API event into our comparison format.
  * Extracts the sharpest available bookmaker's implied probability.
  */
 function normalizeEvent(event) {
