@@ -22,7 +22,7 @@ import config from "./config.js";
 import logger from "./logger.js";
 import * as kalshi from "./execution/kalshi.js";
 import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
-import { fetchAllOdds } from "./execution/bookmaker.js";
+import { fetchOddsForKalshiMarkets } from "./execution/bookmaker.js";
 import { findEdges } from "./analysis/edge.js";
 import { checkCircuitBreaker } from "./risk/circuit-breaker.js";
 import { createProposal, approveProposal } from "./execution/manager.js";
@@ -139,15 +139,17 @@ async function bookmakerPollCycle() {
   state.lastBookmakerPoll = now;
 
   try {
-    const events = await fetchAllOdds();
+    // Kalshi-first: only fetch odds for events that match Kalshi markets
+    const events = await fetchOddsForKalshiMarkets(state.watchedMarkets);
     state.bookmakerOdds = events;
     state.stats.bookmakerPolls++;
 
     logger.info({
       module: "agent",
-      events: events.length,
+      kalshiMarkets: state.watchedMarkets.length,
+      matchedEvents: events.length,
       sports: [...new Set(events.map(e => e.sport))].join(","),
-    }, "Bookmaker odds updated");
+    }, "Bookmaker odds updated (Kalshi-first)");
   } catch (err) {
     logger.error({ module: "agent", err: err.message }, "Bookmaker poll failed");
   }
