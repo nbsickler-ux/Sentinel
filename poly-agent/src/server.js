@@ -273,6 +273,27 @@ async function boot() {
   } else {
     logger.info({ module: "server" }, "Dev mode — agent not auto-started. POST /api/agent/start to begin.");
   }
+
+  // ── KEEP-ALIVE SELF-PING ──
+  // Render free tier suspends after 15 min of no inbound HTTP.
+  // Self-ping goes through the load balancer → counts as inbound.
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL
+    || process.env.SERVICE_URL
+    || (config.env === "production" ? "https://sentinel-poly-agent.onrender.com" : null);
+  if (RENDER_URL) {
+    const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+    setInterval(async () => {
+      try {
+        const resp = await fetch(`${RENDER_URL}/health`);
+        if (resp.ok) {
+          logger.debug({ module: "keepalive" }, "Self-ping OK");
+        }
+      } catch (err) {
+        logger.warn({ module: "keepalive", err: err.message }, "Self-ping failed");
+      }
+    }, PING_INTERVAL_MS);
+    logger.info({ module: "keepalive", url: RENDER_URL, intervalMin: 10 }, "Keep-alive self-ping enabled");
+  }
 }
 
 boot().catch((err) => {
