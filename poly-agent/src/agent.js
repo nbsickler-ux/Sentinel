@@ -1,274 +1,285 @@
 // ============================================================
-// POLY-AGENT: MAIN ORCHESTRATOR (v3 — Math-Based Edge Detection)
+// WEATHER BOT: MAIN ORCHESTRATOR
 //
 // Architecture:
 //   Two parallel data streams:
-//     1. Kalshi prices (every 30s) — what the prediction market thinks
-//     2. Bookmaker odds (every 60s) — what sharp money thinks (= fair value)
-//   Edge = bookmaker implied probability − Kalshi price − fees
-//   No LLM in the hot path. Pure math. Milliseconds per cycle.
+//     1. Kalshi temperature markets (every 60s) — market prices
+//     2. Open-Meteo ensemble forecasts (every 5 min) — model probabilities
+//   Edge = model_probability − market_price − fees
+//   No LLM. Pure math. Ensemble statistics vs market prices.
 //
 // Three operating modes:
 //   "analysis"    — Detect edges + log, execute nothing
 //   "guarded"     — Auto-execute within tight guardrails
 //   "autonomous"  — Full auto, circuit breaker is the only gate
 //
-// Daily brief (separate from hot path):
-//   Claude reviews yesterday's trades, edge quality, P&L — that's
-//   where human + AI analysis happens, not per-market per-cycle.
+// Cycle:
+//   1. Discover Kalshi temperature markets (KXHIGH* series)
+//   2. Fetch ensemble forecasts for all 5 cities
+//   3. Parse brackets, compute probabilities, find edges
+//   4. Execute or log based on mode
+//   5. Hold to settlement (default)
 // ============================================================
 
 import config from "./config.js";
 import logger from "./logger.js";
 import * as kalshi from "./execution/kalshi.js";
-import { getMarkets as getPolymarketMarkets, getPrice as getPolymarketPrice } from "./execution/polymarket.js";
-import { fetchOddsForKalshiMarkets } from "./execution/bookmaker.js";
-import { findEdges } from "./analysis/edge.js";
+import {
+  CITIES,
+  fetchAllForecasts,
+  parseBracketFromTitle,
+  getTomorrowDateET,
+  getTodayDateET,
+} from "./execution/weather.js";
+import { findWeatherEdges, summarizeEdges } from "./analysis/edge.js";
 import { checkCircuitBreaker } from "./risk/circuit-breaker.js";
 import { createProposal, approveProposal } from "./execution/manager.js";
-import { evaluateExits as evaluatePositionExits } from "./execution/positions.js";
 import { pool } from "./db/schema.js";
 
 // ── STATE ──
 
 const state = {
-  watchedMarkets: [],
-  latestOdds: new Map(),           // marketId → { yes, no, timestamp }
-  bookmakerOdds: [],               // latest bookmaker events from The Odds API
-  lastBookmakerPoll: 0,
-  lastOddsScan: 0,
-  detectedEdges: [],               // current edges found this cycle
-  tradeLog: [],                    // trades executed today (for daily brief)
+  // Kalshi temperature markets, parsed with bracket info
+  weatherMarkets: [],
+
+  // Latest ensemble forecasts: cityCode → { members, modelInfo }
+  forecasts: {},
+
+  // Detected edges this cycle
+  detectedEdges: [],
+
+  // Trade log for daily review
+  tradeLog: [],
+
+  // Timestamps
+  lastMarketScan: 0,
+  lastForecastFetch: 0,
+  lastEdgeScan: 0,
+
   cycleCount: 0,
   running: false,
+
   stats: {
     edgesDetected: 0,
     edgesActedOn: 0,
-    proposals: 0,
     autoExecuted: 0,
-    marketsMatched: 0,             // Kalshi markets matched to bookmaker events
-    skippedNoMatch: 0,             // Kalshi markets with no bookmaker equivalent
-    bookmakerPolls: 0,
+    marketsFound: 0,
+    forecastFetches: 0,
     kalshiPolls: 0,
   },
 };
 
 // ── MARKET DISCOVERY ──
 
-async function discoverMarkets() {
+/**
+ * Fetch Kalshi temperature markets for all 5 cities.
+ * Uses series tickers: KXHIGHNY, KXHIGHCHI, KXHIGHMIA, KXHIGHLAX, KXHIGHDEN
+ */
+async function discoverWeatherMarkets() {
+  const now = Date.now();
+  const scanIntervalMs = config.weather?.marketScanMs || 300_000; // 5 min
+  if (now - state.lastMarketScan < scanIntervalMs) return;
+  state.lastMarketScan = now;
+
   const allMarkets = [];
 
-  // ── Kalshi discovery ──
-  if (config.platforms?.kalshi?.enabled) {
+  for (const [cityCode, city] of Object.entries(CITIES)) {
     try {
-      const markets = await kalshi.getMarkets({ status: "open", limit: 200 });
-
-      // Log a sample of raw Kalshi market objects to diagnose field availability
-      if (markets.length > 0) {
-        const sample = markets.slice(0, 3).map(m => ({
-          ticker: m.ticker,
-          event_ticker: m.event_ticker,
-          yes_sub_title: m.yes_sub_title,
-          no_sub_title: m.no_sub_title,
-          title: m.title,          // likely undefined on markets (exists on events)
-          subtitle: m.subtitle,    // likely undefined on markets
-          category: m.category,
-          status: m.status,
-        }));
-        logger.info({ module: "agent", platform: "kalshi", sample }, "Kalshi market sample (raw fields)");
-      }
+      // Fetch markets for this city's series
+      const markets = await kalshi.getMarkets({
+        seriesTicker: city.seriesTicker,
+        status: "open",
+        limit: 50,
+      });
 
       for (const m of markets) {
-        // Kalshi MARKETS don't have title/subtitle — those are on EVENTS.
-        // Markets have: yes_sub_title, no_sub_title, event_ticker, ticker
-        // yes_sub_title often contains team/outcome info like "Lakers win" or "Over 220.5"
-        const question = m.yes_sub_title || m.no_sub_title || m.event_ticker || m.ticker;
+        // Parse the bracket from the market title
+        const bracketTitle = m.yes_sub_title || m.no_sub_title || "";
+        const bracket = parseBracketFromTitle(bracketTitle);
+
+        if (!bracket) {
+          logger.debug({
+            module: "agent",
+            ticker: m.ticker,
+            title: bracketTitle,
+          }, "Could not parse bracket — skipping");
+          continue;
+        }
+
+        // Parse YES price
+        let yesPrice = null;
+        if (m.yes_ask != null) {
+          yesPrice = m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask;
+        } else if (m.last_price != null) {
+          yesPrice = m.last_price > 1 ? m.last_price / 100 : m.last_price;
+        }
 
         allMarkets.push({
-          id: m.ticker,
-          question,
-          platform: "kalshi",
-          sport: m.category || "unknown",
-          active: m.status === "open" || m.status === "active",
-          lastYesPrice: m.yes_ask_dollars != null ? m.yes_ask_dollars : (m.last_price_dollars != null ? m.last_price_dollars : (m.yes_ask != null ? (m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask) : (m.last_price != null ? (m.last_price > 1 ? m.last_price / 100 : m.last_price) : 0.5))),
-          lastNoPrice: m.no_ask_dollars != null ? m.no_ask_dollars : (m.no_ask != null ? (m.no_ask > 1 ? m.no_ask / 100 : m.no_ask) : 0.5),
           ticker: m.ticker,
-          eventTicker: m.event_ticker,  // human-readable event grouping
-          yesSub: m.yes_sub_title,      // outcome description
-          noSub: m.no_sub_title,        // opposite outcome
-          closeTime: m.close_time || m.latest_expiration_time,
-          volume: m.volume_fp || m.volume || 0,
+          cityCode,
+          cityName: city.name,
+          seriesTicker: city.seriesTicker,
+          bracket,
+          bracketLabel: bracketTitle,
+          yesPrice,
+          noPrice: yesPrice != null ? 1 - yesPrice : null,
+          volume: m.volume || 0,
+          openInterest: m.open_interest || 0,
+          closeTime: m.close_time || m.expiration_time,
           rawData: m,
         });
       }
-      logger.info({ module: "agent", platform: "kalshi", found: allMarkets.filter(m => m.platform === "kalshi").length }, "Kalshi markets discovered");
-    } catch (err) {
-      logger.error({ module: "agent", platform: "kalshi", err: err.message }, "Kalshi discovery failed");
-    }
-  }
-
-  // ── Polymarket discovery ──
-  if (config.platforms?.polymarket?.enabled) {
-    try {
-      const enabledSports = config.sports
-        ? Object.values(config.sports).filter((s) => s.enabled).map((s) => s.tag)
-        : ["nba", "mlb", "nhl"];
-      for (const tag of enabledSports) {
-        const markets = await getPolymarketMarkets({ tag, limit: 30 });
-        for (const m of markets) {
-          allMarkets.push({
-            id: m.condition_id || m.id,
-            question: m.question || m.title,
-            platform: "polymarket",
-            sport: tag,
-            active: m.active,
-            lastYesPrice: m.tokens?.[0]?.price || 0,
-            lastNoPrice: m.tokens?.[1]?.price || 0,
-            tokens: m.tokens,
-            condition_id: m.condition_id,
-            rawData: m,
-          });
-        }
-      }
-      logger.info({ module: "agent", platform: "polymarket", found: allMarkets.filter(m => m.platform === "polymarket").length }, "Polymarket markets discovered");
-    } catch (err) {
-      logger.error({ module: "agent", platform: "polymarket", err: err.message }, "Polymarket discovery failed");
-    }
-  }
-
-  // Deduplicate by id
-  const seen = new Set();
-  state.watchedMarkets = allMarkets.filter((m) => {
-    if (seen.has(m.id)) return false;
-    seen.add(m.id);
-    return m.active;
-  });
-
-  logger.info({
-    module: "agent",
-    watching: state.watchedMarkets.length,
-    kalshi: state.watchedMarkets.filter(m => m.platform === "kalshi").length,
-    polymarket: state.watchedMarkets.filter(m => m.platform === "polymarket").length,
-  }, "Market discovery complete");
-
-  return state.watchedMarkets;
-}
-
-// ── BOOKMAKER ODDS POLLING ──
-
-async function bookmakerPollCycle() {
-  const now = Date.now();
-  const pollMs = config.bookmaker?.pollMs || 60_000;
-  if (now - state.lastBookmakerPoll < pollMs) return;
-  state.lastBookmakerPoll = now;
-
-  try {
-    // Kalshi-first: only fetch odds for events that match Kalshi markets
-    const events = await fetchOddsForKalshiMarkets(state.watchedMarkets);
-    state.bookmakerOdds = events;
-    state.stats.bookmakerPolls++;
-
-    logger.info({
-      module: "agent",
-      kalshiMarkets: state.watchedMarkets.length,
-      matchedEvents: events.length,
-      sports: [...new Set(events.map(e => e.sport))].join(","),
-    }, "Bookmaker odds updated (Kalshi-first)");
-  } catch (err) {
-    logger.error({ module: "agent", err: err.message }, "Bookmaker poll failed");
-  }
-}
-
-// ── KALSHI ODDS SCAN + EDGE DETECTION ──
-
-async function oddsScanCycle() {
-  const now = Date.now();
-  if (now - state.lastOddsScan < config.triggers.oddsPollMs) return;
-  state.lastOddsScan = now;
-  state.stats.kalshiPolls++;
-
-  // Update prices on watched markets
-  for (const market of state.watchedMarkets.slice(0, 50)) {
-    const marketId = market.id;
-    let price;
-    try {
-      if (market.platform === "kalshi") {
-        price = await kalshi.getPrice(market.ticker);
-      } else {
-        price = await getPolymarketPrice(market);
-      }
-    } catch (err) {
-      continue;
-    }
-    if (!price || price.yes == null) continue;
-
-    state.latestOdds.set(marketId, { ...price, timestamp: now });
-
-    // Update the market object with latest prices for edge matching
-    market.lastYesPrice = price.yes;
-    market.lastNoPrice = price.no;
-
-    // Record to DB (non-blocking)
-    if (pool) {
-      pool.query(
-        `INSERT INTO poly_odds_history (condition_id, yes_price, no_price)
-         VALUES ($1, $2, $3)`,
-        [marketId, price.yes, price.no]
-      ).catch(() => {});
-    }
-  }
-
-  // ── EDGE DETECTION: Pure math comparison ──
-  if (state.bookmakerOdds.length > 0) {
-    const edges = findEdges(state.watchedMarkets, state.bookmakerOdds);
-    state.detectedEdges = edges;
-
-    if (edges.length > 0) {
-      const tradeEligible = edges.filter(e => e.tradeEligible);
-      const logOnly = edges.filter(e => !e.tradeEligible);
-      state.stats.edgesDetected += edges.length;
 
       logger.info({
         module: "agent",
-        total: edges.length,
-        tradeEligible: tradeEligible.length,
-        logOnly: logOnly.length,
-        topEdge: `${edges[0].ticker} ${edges[0].side} ${edges[0].edgeCents}¢`,
-        topFairValue: edges[0].fairValue?.toFixed(3),
-        topKalshiPrice: edges[0].kalshiPrice?.toFixed(3),
-      }, "Edges detected");
-
-      // Log-only edges (6-6¢ range) get recorded for calibration but never traded
-      for (const edge of logOnly) {
-        state.tradeLog.push({
-          timestamp: Date.now(),
-          type: "edge_logged",
-          ...edge,
-          executed: false,
-          reason: "below_trade_threshold",
-        });
-      }
-
-      // Trade-eligible edges (7¢+) go through the execution pipeline
-      for (const edge of tradeEligible) {
-        await actOnEdge(edge);
-      }
+        city: city.name,
+        series: city.seriesTicker,
+        found: markets.length,
+        parsed: allMarkets.filter(m => m.cityCode === cityCode).length,
+      }, "Weather markets discovered");
+    } catch (err) {
+      logger.error({
+        module: "agent",
+        city: city.name,
+        err: err.message,
+      }, "Failed to fetch weather markets");
     }
   }
 
-  // ── EVALUATE EXITS on open positions ──
-  // Pass bookmaker events so exits can re-compare to fair value
-  try {
-    await evaluatePositionExits(state.latestOdds, state.bookmakerOdds);
-  } catch (err) {
-    // Positions module might not have open positions yet
+  state.weatherMarkets = allMarkets;
+  state.stats.marketsFound = allMarkets.length;
+
+  logger.info({
+    module: "agent",
+    totalMarkets: allMarkets.length,
+    cities: [...new Set(allMarkets.map(m => m.cityCode))].length,
+    brackets: allMarkets.map(m => `${m.cityCode}:${m.bracketLabel}`).slice(0, 5),
+  }, "Weather market discovery complete");
+
+  return allMarkets;
+}
+
+// ── FORECAST FETCHING ──
+
+/**
+ * Fetch ensemble forecasts for tomorrow (the day temperature markets settle on).
+ */
+async function fetchForecasts() {
+  const now = Date.now();
+  const fetchIntervalMs = config.weather?.forecastPollMs || 300_000; // 5 min
+  if (now - state.lastForecastFetch < fetchIntervalMs) return;
+  state.lastForecastFetch = now;
+  state.stats.forecastFetches++;
+
+  // Temperature markets launched today settle tomorrow
+  // Fetch both today and tomorrow to cover markets settling either day
+  const tomorrow = getTomorrowDateET();
+  const today = getTodayDateET();
+
+  // Primary: tomorrow's forecast (most markets)
+  state.forecasts = await fetchAllForecasts(tomorrow);
+
+  // Also check if any markets settle today (launched yesterday)
+  const todayForecasts = await fetchAllForecasts(today);
+
+  // Merge: keep tomorrow as primary, add today data under separate key
+  state.forecastsToday = todayForecasts;
+
+  logger.info({
+    module: "agent",
+    tomorrowDate: tomorrow,
+    todayDate: today,
+    tomorrowMembers: Object.values(state.forecasts).reduce((s, f) => s + f.members.length, 0),
+    todayMembers: Object.values(todayForecasts).reduce((s, f) => s + f.members.length, 0),
+  }, "Forecasts updated");
+}
+
+// ── EDGE DETECTION + EXECUTION ──
+
+/**
+ * Main edge scan: compare model probabilities to market prices.
+ */
+async function edgeScanCycle() {
+  const now = Date.now();
+  const scanIntervalMs = config.weather?.edgeScanMs || 60_000; // 60s
+  if (now - state.lastEdgeScan < scanIntervalMs) return;
+  state.lastEdgeScan = now;
+  state.stats.kalshiPolls++;
+
+  if (state.weatherMarkets.length === 0) {
+    logger.debug({ module: "agent" }, "No weather markets — skipping edge scan");
+    return;
+  }
+
+  if (Object.keys(state.forecasts).length === 0) {
+    logger.debug({ module: "agent" }, "No forecasts — skipping edge scan");
+    return;
+  }
+
+  // Refresh prices on all weather markets
+  for (const market of state.weatherMarkets) {
+    try {
+      const freshMarket = await kalshi.getMarket(market.ticker);
+      if (freshMarket) {
+        if (freshMarket.yes_ask != null) {
+          market.yesPrice = freshMarket.yes_ask > 1 ? freshMarket.yes_ask / 100 : freshMarket.yes_ask;
+        } else if (freshMarket.last_price != null) {
+          market.yesPrice = freshMarket.last_price > 1 ? freshMarket.last_price / 100 : freshMarket.last_price;
+        }
+        market.volume = freshMarket.volume || market.volume;
+      }
+    } catch (err) {
+      // Keep stale price, log and continue
+      logger.debug({ module: "agent", ticker: market.ticker, err: err.message }, "Price refresh failed");
+    }
+  }
+
+  // Find edges using tomorrow's forecasts (primary)
+  const edges = findWeatherEdges(
+    state.weatherMarkets,
+    state.forecasts,
+    {
+      minEdgeCents: config.weather?.minEdgeCents || 5,
+      tradeEdgeCents: config.weather?.tradeEdgeCents || 7,
+      minVolume: config.weather?.minVolume || 0,
+      minMembers: config.weather?.minMembers || 10,
+    }
+  );
+
+  state.detectedEdges = edges;
+
+  if (edges.length > 0) {
+    state.stats.edgesDetected += edges.length;
+    const summary = summarizeEdges(edges);
+
+    logger.info({
+      module: "agent",
+      ...summary,
+    }, "Edge scan complete");
+
+    // Process trade-eligible edges
+    const tradeEligible = edges.filter(e => e.tradeEligible);
+    for (const edge of tradeEligible) {
+      await actOnEdge(edge);
+    }
+
+    // Log all edges for calibration
+    for (const edge of edges) {
+      state.tradeLog.push({
+        timestamp: Date.now(),
+        type: edge.tradeEligible ? "edge_trade_eligible" : "edge_logged",
+        ...edge,
+        executed: false,
+      });
+    }
+  } else {
+    logger.info({ module: "agent", markets: state.weatherMarkets.length }, "No edges found this cycle");
   }
 }
 
 // ── EDGE EXECUTION ──
 
 async function actOnEdge(edge) {
-  // Safety check: only trade-eligible edges (7¢+) should reach here
   if (!edge.tradeEligible) return;
 
   const breaker = await checkCircuitBreaker();
@@ -277,53 +288,44 @@ async function actOnEdge(edge) {
     return;
   }
 
-  const bankroll = breaker.details?.current_bankroll || 1000;
+  const bankroll = breaker.details?.current_bankroll || 500;
 
-  // Build a proposal-compatible object from the edge
+  // Build proposal
   const proposalData = {
-    direction: edge.side === "yes" ? "buy_yes" : "buy_no",
-    edge_vs_market: edge.edgeCents,
-    fair_value: edge.fairValue,
-    confidence: Math.min(0.9, 0.5 + (edge.bookmakerCount / 20)), // More bookmakers = more confidence
-    market_price: edge.kalshiPrice,
-    reasoning: `Cross-platform edge: ${edge.sharpBook} implies ${(edge.fairValue * 100).toFixed(1)}% vs Kalshi ${(edge.kalshiPrice * 100).toFixed(1)}% (${edge.bookmakerCount} books, ${edge.edgeCents}¢ after fees)`,
-    condition_id: edge.marketId,
+    direction: edge.side === "buy_yes" ? "buy_yes" : "buy_no",
+    edge_vs_market: edge.netEdgeCents,
+    fair_value: edge.modelProb,
+    confidence: edge.confidence,
+    market_price: edge.marketPrice,
+    reasoning: `Weather edge: model=${(edge.modelProb * 100).toFixed(1)}% vs market=${(edge.marketPrice * 100).toFixed(1)}% (${edge.ensembleMembers} members, ${edge.netEdgeCents}¢ net after ${edge.feeCents}¢ fee) [${edge.cityName} ${edge.bracketLabel}]`,
+    condition_id: edge.ticker,
   };
 
   const proposal = await createProposal(proposalData, bankroll, breaker.details?.size_multiplier || 1);
   if (!proposal) return;
 
-  state.stats.proposals++;
   state.stats.edgesActedOn++;
 
-  // ── OPERATING MODE ──
   if (config.mode === "analysis") {
     logger.info({
       module: "agent",
       mode: "analysis",
-      market: edge.ticker,
+      ticker: edge.ticker,
+      city: edge.cityName,
+      bracket: edge.bracketLabel,
       side: edge.side,
-      edge: `${edge.edgeCents}¢`,
-      fairValue: edge.fairValue?.toFixed(3),
-      kalshiPrice: edge.kalshiPrice?.toFixed(3),
-      sharpBook: edge.sharpBook,
-      books: edge.bookmakerCount,
+      modelProb: `${(edge.modelProb * 100).toFixed(1)}%`,
+      marketPrice: `${(edge.marketPrice * 100).toFixed(1)}%`,
+      netEdge: `${edge.netEdgeCents}¢`,
+      members: edge.ensembleMembers,
     }, "Edge logged (analysis mode — no execution)");
-
-    // Log to trade log for daily brief
-    state.tradeLog.push({
-      timestamp: Date.now(),
-      type: "edge_detected",
-      ...edge,
-      executed: false,
-    });
 
   } else if (config.mode === "guarded") {
     const { maxSizeUsd, minEdgeCents, minConfidence } = config.autoExec;
     const withinGuardrails =
       proposal.size_usd <= maxSizeUsd &&
-      edge.edgeCents >= minEdgeCents &&
-      proposalData.confidence >= minConfidence;
+      edge.netEdgeCents >= minEdgeCents &&
+      edge.confidence >= minConfidence;
 
     if (withinGuardrails) {
       const result = await approveProposal(proposal.id);
@@ -333,9 +335,9 @@ async function actOnEdge(edge) {
         logger.info({
           module: "agent",
           mode: "guarded",
-          market: edge.ticker,
+          ticker: edge.ticker,
           side: edge.side,
-          edge: `${edge.edgeCents}¢`,
+          edge: `${edge.netEdgeCents}¢`,
           size: `$${proposal.size_usd}`,
         }, "Auto-executed (within guardrails)");
       }
@@ -343,9 +345,9 @@ async function actOnEdge(edge) {
       logger.info({
         module: "agent",
         mode: "guarded",
-        market: edge.ticker,
+        ticker: edge.ticker,
         reason: proposal.size_usd > maxSizeUsd ? "size_exceeds_limit"
-          : edge.edgeCents < minEdgeCents ? "edge_below_threshold"
+          : edge.netEdgeCents < minEdgeCents ? "edge_below_threshold"
           : "confidence_below_threshold",
       }, "Edge held (outside guardrails)");
     }
@@ -358,19 +360,19 @@ async function actOnEdge(edge) {
       logger.info({
         module: "agent",
         mode: "autonomous",
-        market: edge.ticker,
-        edge: `${edge.edgeCents}¢`,
+        ticker: edge.ticker,
+        edge: `${edge.netEdgeCents}¢`,
         size: `$${proposal.size_usd}`,
       }, "Auto-executed (autonomous)");
     }
   }
 
-  // Record edge to DB for daily brief analysis
+  // Record to DB
   if (pool) {
     pool.query(
       `INSERT INTO poly_edges (market_id, ticker, side, kalshi_price, fair_value, edge_cents, sharp_book, bookmaker_count, executed, mode)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [edge.marketId, edge.ticker, edge.side, edge.kalshiPrice, edge.fairValue, edge.edgeCents, edge.sharpBook, edge.bookmakerCount, config.mode !== "analysis", config.mode]
+      [edge.ticker, edge.ticker, edge.side, edge.marketPrice, edge.modelProb, edge.netEdgeCents, "ensemble", edge.ensembleMembers, config.mode !== "analysis", config.mode]
     ).catch(() => {});
   }
 }
@@ -380,11 +382,15 @@ async function actOnEdge(edge) {
 async function tick() {
   state.cycleCount++;
   try {
-    // Two parallel streams: bookmaker odds + Kalshi prices
-    await bookmakerPollCycle();
-    await oddsScanCycle();
+    // Three phases per tick:
+    // 1. Discover/refresh temperature markets (every 5 min)
+    // 2. Fetch/refresh ensemble forecasts (every 5 min)
+    // 3. Scan for edges and execute (every 60s)
+    await discoverWeatherMarkets();
+    await fetchForecasts();
+    await edgeScanCycle();
   } catch (err) {
-    logger.error({ module: "agent", err: err.message }, "Tick error");
+    logger.error({ module: "agent", err: err.message, stack: err.stack }, "Tick error");
   }
 }
 
@@ -392,69 +398,72 @@ export async function startAgent() {
   if (state.running) return;
   state.running = true;
 
-  const hasOddsApi = !!config.bookmaker?.oddsApiKey;
-
   logger.info({
     module: "agent",
     mode: config.mode,
-    bookmakerEnabled: hasOddsApi,
-    exitRules: config.exits,
-    triggers: config.triggers,
-  }, "Poly-Agent v3 starting (math-based edge detection)...");
+    cities: Object.keys(CITIES).length,
+    strategy: "weather-ensemble",
+  }, "Weather Bot starting...");
 
-  if (!hasOddsApi) {
-    logger.warn({ module: "agent" }, "No ODDS_API_KEY — running Kalshi-only without cross-platform comparison. Add ODDS_API_KEY for bookmaker edge detection.");
-  }
+  // Initial discovery + forecast
+  await tick();
 
-  await discoverMarkets();
-  setInterval(discoverMarkets, 30 * 60 * 1000);
-
+  // Main loop: tick every 30s
   const tickInterval = setInterval(async () => {
     if (!state.running) {
       clearInterval(tickInterval);
       return;
     }
     await tick();
-  }, 15_000);
+  }, 30_000);
 
-  await tick();
-  logger.info({ module: "agent", mode: config.mode }, "Poly-Agent running");
+  logger.info({ module: "agent", mode: config.mode }, "Weather Bot running");
 }
 
 export function stopAgent() {
   state.running = false;
-  logger.info({ module: "agent" }, "Poly-Agent stopped");
+  logger.info({ module: "agent" }, "Weather Bot stopped");
 }
 
 export function getState() {
   return {
     running: state.running,
     mode: config.mode,
+    strategy: "weather-ensemble",
     cycleCount: state.cycleCount,
-    watchedMarkets: state.watchedMarkets.length,
-    latestOdds: Object.fromEntries(state.latestOdds),
-    bookmakerEvents: state.bookmakerOdds.length,
-    detectedEdges: state.detectedEdges.slice(0, 10), // top 10 for dashboard
+    weatherMarkets: state.weatherMarkets.length,
+    marketsByCity: Object.fromEntries(
+      Object.keys(CITIES).map(code => [
+        code,
+        state.weatherMarkets.filter(m => m.cityCode === code).length,
+      ])
+    ),
+    forecastStatus: Object.fromEntries(
+      Object.entries(state.forecasts).map(([code, f]) => [
+        code,
+        { members: f.members.length, min: f.members.length > 0 ? Math.min(...f.members).toFixed(1) : null, max: f.members.length > 0 ? Math.max(...f.members).toFixed(1) : null },
+      ])
+    ),
+    detectedEdges: state.detectedEdges.slice(0, 10),
     stats: state.stats,
-    lastOddsScan: state.lastOddsScan,
-    lastBookmakerPoll: state.lastBookmakerPoll,
-    exitRules: config.exits,
-    autoExec: config.autoExec,
+    lastMarketScan: state.lastMarketScan,
+    lastForecastFetch: state.lastForecastFetch,
+    lastEdgeScan: state.lastEdgeScan,
     tradeLogToday: state.tradeLog.length,
   };
 }
 
-/**
- * Get today's trade log for daily brief generation.
- */
 export function getDailyBriefData() {
   return {
     date: new Date().toISOString().split("T")[0],
     mode: config.mode,
+    strategy: "weather-ensemble",
     stats: { ...state.stats },
     edges: [...state.detectedEdges],
     tradeLog: [...state.tradeLog],
-    watchedMarkets: state.watchedMarkets.length,
-    bookmakerEvents: state.bookmakerOdds.length,
+    weatherMarkets: state.weatherMarkets.length,
+    forecasts: Object.fromEntries(
+      Object.entries(state.forecasts).map(([code, f]) => [code, f.modelInfo])
+    ),
   };
 }

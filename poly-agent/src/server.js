@@ -1,6 +1,6 @@
 // ============================================================
-// POLY-AGENT SERVER
-// Express API + Dashboard for the Polymarket prediction agent.
+// WEATHER BOT SERVER
+// Express API + Dashboard for the Kalshi weather trading bot.
 // ============================================================
 
 import express from "express";
@@ -9,7 +9,6 @@ import { fileURLToPath } from "url";
 import config from "./config.js";
 import logger from "./logger.js";
 import { initializeDatabase } from "./db/schema.js";
-import { initClobClient } from "./execution/polymarket.js";
 import { init as initKalshi, isEnabled as kalshiEnabled, getBalance as kalshiBalance } from "./execution/kalshi.js";
 import { startAgent, stopAgent, getState } from "./agent.js";
 import {
@@ -34,12 +33,10 @@ app.get("/health", (_req, res) => {
     status: "ok",
     agent: state.running ? "running" : "stopped",
     mode: state.mode,
-    markets: state.watchedMarkets,
+    strategy: "weather-ensemble",
+    markets: state.weatherMarkets,
     cycles: state.cycleCount,
-    platforms: {
-      polymarket: !!config.platforms?.polymarket?.enabled,
-      kalshi: kalshiEnabled(),
-    },
+    kalshi: kalshiEnabled(),
     uptime: process.uptime(),
   });
 });
@@ -94,10 +91,9 @@ app.get("/api/edges", async (_req, res) => {
 app.get("/api/match-rate", async (_req, res) => {
   try {
     const state = getState();
-    const totalKalshi = state.watchedMarkets?.length || 0;
-    const totalBookmaker = state.bookmakerOdds?.length || 0;
+    const totalMarkets = state.weatherMarkets || 0;
     const edges = state.detectedEdges || [];
-    const matchedMarkets = new Set(edges.map(e => e.marketId));
+    const matchedMarkets = new Set(edges.map(e => e.ticker));
 
     // Also pull historical match data from edges table
     const { pool } = await import("./db/schema.js");
@@ -121,10 +117,9 @@ app.get("/api/match-rate", async (_req, res) => {
 
     res.json({
       current: {
-        kalshiMarketsWatched: totalKalshi,
-        bookmakerEventsLoaded: totalBookmaker,
+        weatherMarketsWatched: totalMarkets,
         marketsWithEdge: matchedMarkets.size,
-        matchRate: totalKalshi > 0 ? `${((matchedMarkets.size / totalKalshi) * 100).toFixed(1)}%` : "0%",
+        edgeRate: totalMarkets > 0 ? `${((matchedMarkets.size / totalMarkets) * 100).toFixed(1)}%` : "0%",
       },
       historical,
     });
@@ -242,9 +237,8 @@ async function boot() {
   // Initialize database
   await initializeDatabase();
 
-  // Initialize platform clients
-  await initClobClient();  // Polymarket (read-only if no wallet key)
-  initKalshi();            // Kalshi (read-only if no RSA key)
+  // Initialize Kalshi client
+  initKalshi();
 
   // Start listening
   app.listen(config.port, () => {
