@@ -1,6 +1,10 @@
 // bookmaker.js — Fetches bookmaker odds for cross-platform comparison
-// Uses Odds-API.io (free tier: 100 requests/hour, no monthly cap)
+// Uses Odds-API.io v3 (free tier: 5,000 requests/hour)
 // Docs: https://docs.odds-api.io
+//
+// Flow: 1. GET /events?sport=X → event IDs
+//       2. GET /odds/multi?eventIds=a,b,c&bookmakers=X,Y → odds per event
+//       3. Normalize into { homeTeam, awayTeam, consensusProbs, sharpProbs }
 
 import axios from "axios";
 import logger from "../logger.js";
@@ -9,56 +13,95 @@ import config from "../config.js";
 const ODDS_API_BASE = "https://api.odds-api.io/v3";
 const apiKey = process.env.ODDS_API_KEY || "";
 
-// Map Kalshi sport categories to API sport keys
+// Map Kalshi sport categories to Odds-API.io sport slugs
 const SPORT_MAP = {
-  nba: "basketball_nba",
-  nfl: "americanfootball_nfl",
-  mlb: "baseball_mlb",
-  nhl: "icehockey_nhl",
-  ncaab: "basketball_ncaab",
-  mls: "soccer_usa_mls",
-  ufc: "mma_mixed_martial_arts",
+  nba: "basketball",
+  nfl: "american-football",
+  mlb: "baseball",
+  nhl: "ice-hockey",
+  ncaab: "basketball",
+  mls: "football",
+  ufc: "mixed-martial-arts",
 };
 
 // Preferred bookmakers in order of "sharpness" (Pinnacle most sharp)
-const SHARP_BOOKS = ["pinnacle", "betonlineag", "bovada", "fanduel", "draftkings", "betmgm"];
+// Names must match Odds-API.io bookmaker names exactly
+const SHARP_BOOKS = ["Pinnacle", "BetOnline", "Bovada", "FanDuel", "DraftKings", "BetMGM"];
+
+// Bookmakers to request odds from (comma-separated for API)
+const BOOKMAKER_LIST = "Pinnacle,BetOnline,Bovada,FanDuel,DraftKings,BetMGM,Bet365";
 
 /**
- * Fetch odds for a sport from Odds-API.io.
+ * Fetch events for a sport from Odds-API.io, then fetch odds for each.
  * Returns normalized array of events with implied probabilities.
  */
-export async function fetchOdds(sportKey) {
+export async function fetchOdds(sportSlug) {
   if (!apiKey) {
     logger.warn({ module: "bookmaker" }, "No ODDS_API_KEY configured — bookmaker comparison disabled");
     return [];
   }
 
   try {
-    const resp = await axios.get(`${ODDS_API_BASE}/odds`, {
+    // Step 1: Get upcoming events for this sport
+    const eventsResp = await axios.get(`${ODDS_API_BASE}/events`, {
       params: {
         apiKey,
-        sport: sportKey,
-        region: "us",
-        mkt: "h2h",
-        oddsFormat: "decimal",
+        sport: sportSlug,
+        status: "pending",
       },
       timeout: 10_000,
     });
 
-    const remaining = resp.headers["x-requests-remaining"];
-    const used = resp.headers["x-requests-used"];
-    logger.info({ module: "bookmaker", sport: sportKey, events: resp.data?.length || 0, remaining, used }, "Bookmaker odds fetched");
+    const events = eventsResp.data || [];
+    if (events.length === 0) {
+      logger.info({ module: "bookmaker", sport: sportSlug, events: 0 }, "No upcoming events");
+      return [];
+    }
 
-    return (resp.data || []).map(normalizeEvent);
+    // Step 2: Fetch odds in batches of 10 (multi endpoint)
+    const allNormalized = [];
+    const batches = chunkArray(events, 10);
+
+    for (const batch of batches) {
+      const eventIds = batch.map(e => e.id).join(",");
+      try {
+        const oddsResp = await axios.get(`${ODDS_API_BASE}/odds/multi`, {
+          params: {
+            apiKey,
+            eventIds,
+            bookmakers: BOOKMAKER_LIST,
+          },
+          timeout: 15_000,
+        });
+
+        const oddsData = oddsResp.data || [];
+        for (const eventOdds of oddsData) {
+          const normalized = normalizeEvent(eventOdds);
+          if (normalized) allNormalized.push(normalized);
+        }
+      } catch (err) {
+        logger.error({ module: "bookmaker", sport: sportSlug, err: err.message }, "Failed to fetch odds batch");
+      }
+    }
+
+    const remaining = "check headers";
+    logger.info({
+      module: "bookmaker",
+      sport: sportSlug,
+      eventsFound: events.length,
+      oddsNormalized: allNormalized.length,
+    }, "Bookmaker odds fetched");
+
+    return allNormalized;
   } catch (err) {
     const status = err.response?.status;
-    logger.error({ module: "bookmaker", sport: sportKey, status, err: err.message }, "Failed to fetch bookmaker odds");
+    logger.error({ module: "bookmaker", sport: sportSlug, status, err: err.message }, "Failed to fetch bookmaker events");
     return [];
   }
 }
 
 /**
- * Fetch odds for ALL configured sports in one batch.
+ * Fetch odds for ALL configured sports.
  */
 export async function fetchAllOdds() {
   const enabledSports = Object.entries(config.sports || {})
@@ -78,77 +121,95 @@ export async function fetchAllOdds() {
 }
 
 /**
- * Normalize an API event into our comparison format.
- * Extracts the sharpest available bookmaker's implied probability.
+ * Normalize an Odds-API.io event+odds response into our comparison format.
+ *
+ * Odds-API.io response structure:
+ * {
+ *   id, home, away, date, status, sport, league,
+ *   bookmakers: {
+ *     "Pinnacle": [{ name: "ML", odds: [{ home: "2.10", away: "1.85" }] }],
+ *     "Bet365":   [{ name: "ML", odds: [{ home: "2.05", away: "1.90" }] }],
+ *   }
+ * }
  */
-function normalizeEvent(event) {
-  const bookmakers = event.bookmakers || [];
+function normalizeEvent(eventOdds) {
+  const bookmakers = eventOdds.bookmakers || {};
+  const bookmakerNames = Object.keys(bookmakers);
+  if (bookmakerNames.length === 0) return null;
 
   // Find the sharpest available bookmaker
-  let bestBook = null;
+  let sharpBookName = null;
   for (const preferred of SHARP_BOOKS) {
-    bestBook = bookmakers.find(b => b.key === preferred);
-    if (bestBook) break;
+    if (bookmakers[preferred]) {
+      sharpBookName = preferred;
+      break;
+    }
   }
-  // Fallback to first available
-  if (!bestBook && bookmakers.length > 0) bestBook = bookmakers[0];
+  if (!sharpBookName) sharpBookName = bookmakerNames[0];
 
-  // Extract h2h (moneyline) market
-  const h2hMarket = bestBook?.markets?.find(m => m.key === "h2h");
-  const outcomes = h2hMarket?.outcomes || [];
+  // Extract ML (moneyline) odds from sharp book
+  const sharpMarkets = bookmakers[sharpBookName] || [];
+  const sharpML = sharpMarkets.find(m => m.name === "ML");
+  const sharpOdds = sharpML?.odds?.[0] || {};
 
-  // Calculate consensus implied probability (average across all bookmakers)
-  const consensusProbs = calcConsensusProbs(bookmakers);
+  // Calculate sharp book implied probs (remove vig)
+  const sharpProbs = calcImpliedProbsFromML(sharpOdds, eventOdds.home, eventOdds.away);
 
-  // Calculate implied probabilities from the sharp book (remove vig with power method)
-  const sharpProbs = calcImpliedProbs(outcomes);
+  // Calculate consensus implied probability across all bookmakers
+  const consensusProbs = calcConsensusProbs(bookmakers, eventOdds.home, eventOdds.away);
 
   return {
-    eventId: event.id,
-    sport: event.sport_key,
-    homeTeam: event.home_team,
-    awayTeam: event.away_team,
-    commenceTime: event.commence_time,
-    sharpBook: bestBook?.key || "none",
+    eventId: eventOdds.id,
+    sport: eventOdds.sport?.slug || "",
+    homeTeam: eventOdds.home,
+    awayTeam: eventOdds.away,
+    commenceTime: eventOdds.date,
+    sharpBook: sharpBookName,
     sharpProbs,       // { "Team A": 0.55, "Team B": 0.45 }
     consensusProbs,   // averaged across all bookmakers
-    rawOutcomes: outcomes,
-    bookmakerCount: bookmakers.length,
+    rawOutcomes: sharpOdds,
+    bookmakerCount: bookmakerNames.length,
   };
 }
 
 /**
- * Convert decimal odds to implied probabilities, removing vig using the power method.
+ * Convert ML decimal odds to implied probabilities, removing vig.
+ * Odds-API.io returns odds as strings: { home: "2.10", draw: "3.40", away: "1.85" }
  */
-function calcImpliedProbs(outcomes) {
-  if (!outcomes.length) return {};
+function calcImpliedProbsFromML(mlOdds, homeTeam, awayTeam) {
+  const homeOdds = parseFloat(mlOdds.home);
+  const awayOdds = parseFloat(mlOdds.away);
+  const drawOdds = mlOdds.draw ? parseFloat(mlOdds.draw) : null;
 
-  // Raw implied probs (will sum > 1 due to vig)
-  const rawProbs = outcomes.map(o => 1 / o.price);
-  const totalVig = rawProbs.reduce((s, p) => s + p, 0);
+  if (!homeOdds || !awayOdds) return {};
 
-  // Power method to remove vig (more accurate than multiplicative)
-  // Solve for k where sum(p_i^k) = 1
-  // Approximation: divide by total
+  // Raw implied probs (sum > 1 due to vig)
+  const rawHome = 1 / homeOdds;
+  const rawAway = 1 / awayOdds;
+  const rawDraw = drawOdds ? 1 / drawOdds : 0;
+  const total = rawHome + rawAway + rawDraw;
+
+  // Remove vig by dividing by total
   const result = {};
-  for (let i = 0; i < outcomes.length; i++) {
-    result[outcomes[i].name] = rawProbs[i] / totalVig;
-  }
+  result[homeTeam] = rawHome / total;
+  result[awayTeam] = rawAway / total;
+  if (drawOdds) result["draw"] = rawDraw / total;
+
   return result;
 }
 
 /**
  * Calculate consensus implied probability across all bookmakers.
  */
-function calcConsensusProbs(bookmakers) {
+function calcConsensusProbs(bookmakers, homeTeam, awayTeam) {
   const probSums = {};
   let count = 0;
 
-  for (const book of bookmakers) {
-    const h2h = book.markets?.find(m => m.key === "h2h");
-    if (!h2h) continue;
+  for (const [bookName, markets] of Object.entries(bookmakers)) {
+    const ml = markets.find(m => m.name === "ML");
+    if (!ml?.odds?.[0]) continue;
 
-    const probs = calcImpliedProbs(h2h.outcomes);
+    const probs = calcImpliedProbsFromML(ml.odds[0], homeTeam, awayTeam);
     for (const [team, prob] of Object.entries(probs)) {
       probSums[team] = (probSums[team] || 0) + prob;
     }
@@ -161,4 +222,15 @@ function calcConsensusProbs(bookmakers) {
     result[team] = sum / count;
   }
   return result;
+}
+
+/**
+ * Split array into chunks of given size.
+ */
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
 }
