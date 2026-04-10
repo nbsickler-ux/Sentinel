@@ -156,6 +156,7 @@ export async function getMarkets(opts = {}) {
   const queryParts = [];
   if (opts.seriesTicker) queryParts.push(`series_ticker=${encodeURIComponent(opts.seriesTicker)}`);
   if (opts.eventTicker) queryParts.push(`event_ticker=${encodeURIComponent(opts.eventTicker)}`);
+  if (opts.tickers) queryParts.push(`tickers=${encodeURIComponent(opts.tickers)}`);
   if (opts.status) queryParts.push(`status=${encodeURIComponent(opts.status)}`);
   queryParts.push(`limit=${opts.limit || 200}`);
   if (opts.cursor) queryParts.push(`cursor=${encodeURIComponent(opts.cursor)}`);

@@ -219,21 +219,36 @@ async function edgeScanCycle() {
     return;
   }
 
-  // Refresh prices on all weather markets
-  for (const market of state.weatherMarkets) {
+  // Refresh prices on all weather markets using batch calls (5 calls instead of 60)
+  // The getMarkets() list endpoint returns yes_ask, last_price, volume — same fields
+  // we need — so there's no reason to hit getMarket() individually per ticker.
+  const freshByTicker = new Map();
+  const seriesTickers = [...new Set(state.weatherMarkets.map(m => m.seriesTicker))];
+
+  for (const series of seriesTickers) {
     try {
-      const freshMarket = await kalshi.getMarket(market.ticker);
-      if (freshMarket) {
-        if (freshMarket.yes_ask != null) {
-          market.yesPrice = freshMarket.yes_ask > 1 ? freshMarket.yes_ask / 100 : freshMarket.yes_ask;
-        } else if (freshMarket.last_price != null) {
-          market.yesPrice = freshMarket.last_price > 1 ? freshMarket.last_price / 100 : freshMarket.last_price;
-        }
-        market.volume = freshMarket.volume || market.volume;
+      const freshMarkets = await kalshi.getMarkets({
+        seriesTicker: series,
+        status: "open",
+        limit: 50,
+      });
+      for (const fm of freshMarkets) {
+        freshByTicker.set(fm.ticker, fm);
       }
     } catch (err) {
-      // Keep stale price, log and continue
-      logger.debug({ module: "agent", ticker: market.ticker, err: err.message }, "Price refresh failed");
+      logger.debug({ module: "agent", series, err: err.message }, "Batch price refresh failed for series");
+    }
+  }
+
+  for (const market of state.weatherMarkets) {
+    const fresh = freshByTicker.get(market.ticker);
+    if (fresh) {
+      if (fresh.yes_ask != null) {
+        market.yesPrice = fresh.yes_ask > 1 ? fresh.yes_ask / 100 : fresh.yes_ask;
+      } else if (fresh.last_price != null) {
+        market.yesPrice = fresh.last_price > 1 ? fresh.last_price / 100 : fresh.last_price;
+      }
+      market.volume = fresh.volume || market.volume;
     }
   }
 
