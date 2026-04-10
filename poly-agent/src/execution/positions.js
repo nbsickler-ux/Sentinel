@@ -11,8 +11,8 @@
 import { pool } from "../db/schema.js";
 import config from "../config.js";
 import logger from "../logger.js";
-import { placeLimitOrder, cancelOrder, getOrderbook } from "./polymarket.js";
-import { evaluateExits as evaluateEdgeExits } from "../analysis/edge.js";
+// Weather bot holds to settlement — position exits are minimal
+// Old polymarket/bookmaker exit logic removed
 
 /**
  * Evaluate exit conditions for all open positions.
@@ -21,115 +21,28 @@ import { evaluateExits as evaluateEdgeExits } from "../analysis/edge.js";
  * @param {Map} latestOdds - condition_id → { yes, no, timestamp }
  * @param {Array} bookmakerEvents - Latest bookmaker events for fair value comparison
  */
-export async function evaluateExits(latestOdds, bookmakerEvents) {
-  if (!pool) return [];
-
-  const exits = [];
-
-  try {
-    const { rows: positions } = await pool.query(
-      `SELECT * FROM poly_positions WHERE status = 'open' ORDER BY opened_at ASC`
-    );
-
-    if (positions.length === 0) return [];
-
-    // Normalize DB positions into the format edge.js expects
-    const normalizedPositions = positions.map(pos => ({
-      marketId: pos.condition_id,
-      ticker: pos.token_id,
-      side: pos.direction === "buy_yes" ? "yes" : "no",
-      entryPrice: parseFloat(pos.entry_price),
-      question: pos.market_question,
-      commenceTime: pos.close_time || null,  // If stored
-      dbId: pos.id,
-      dbRow: pos,
-    }));
-
-    // Run the bookmaker-referenced exit evaluation from edge.js
-    const exitActions = evaluateEdgeExits(normalizedPositions, latestOdds, bookmakerEvents);
-
-    for (const action of exitActions) {
-      const pos = positions.find(p => p.condition_id === action.marketId);
-      if (!pos) continue;
-
-      const odds = latestOdds.get(pos.condition_id);
-      const currentPrice = pos.direction === "buy_yes" ? odds?.yes : odds?.no;
-      if (currentPrice == null) continue;
-
-      const exitDecision = {
-        shouldExit: action.action === "exit",
-        reason: action.detail || action.reason,
-        type: action.reason,
-        priceDelta: action.pnlCents,
-        currentEdgeCents: action.currentEdgeCents,
-      };
-
-      if (action.action === "exit") {
-        exits.push({ position: pos, ...exitDecision });
-
-        if (config.mode !== "analysis") {
-          await executeExit(pos, exitDecision, currentPrice);
-        } else {
-          await recordPaperExit(pos, exitDecision, currentPrice);
-        }
-      } else if (action.action === "hold") {
-        logger.info({
-          module: "positions",
-          market: pos.market_question?.slice(0, 50),
-          reason: action.reason,
-          edge: `${action.currentEdgeCents}¢`,
-          minutes: action.minutesToEvent,
-        }, "Position held through resolution");
-      }
-    }
-
-    if (exits.length > 0) {
-      logger.info({
-        module: "positions",
-        exits: exits.length,
-        reasons: exits.map((e) => e.type),
-      }, "Position exits evaluated");
-    }
-
-    return exits;
-  } catch (err) {
-    logger.error({ module: "positions", err: err.message }, "Exit evaluation failed");
-    return [];
-  }
+/**
+ * Evaluate exits — weather bot default is hold to settlement.
+ * Only exits on hard stop or forecast flip (handled by agent.js).
+ */
+export async function evaluateExits() {
+  // Weather strategy holds to settlement by default
+  // Early exits only triggered by agent when forecast materially flips
+  return [];
 }
 
 /**
- * Execute a position exit by placing a sell order.
+ * Execute a position exit via Kalshi API.
  */
 async function executeExit(position, exitDecision, currentPrice) {
   try {
-    // Place a limit sell slightly below current price for quick fill
-    const sellPrice = currentPrice - 0.005; // 0.5¢ below market for fast fill
-
-    if (position.token_id && position.token_id !== "paper") {
-      // Sell by buying the opposite token
-      // In Polymarket, selling YES shares = buying NO shares at complementary price
-      const result = await placeLimitOrder({
-        tokenId: position.token_id, // TODO: need opposite token for sell
-        side: "SELL",
-        price: sellPrice,
-        size: parseFloat(position.size_usd),
-      });
-
-      if (result?.orderID) {
-        await updatePositionClosed(position, exitDecision, currentPrice);
-        logger.info({
-          module: "positions",
-          market: position.market_question?.slice(0, 50),
-          type: exitDecision.type,
-          pnl: `${exitDecision.priceDelta >= 0 ? "+" : ""}${exitDecision.priceDelta.toFixed(1)}¢`,
-          orderId: result.orderID,
-        }, "Position exited (live)");
-      }
-    } else {
-      // Paper position — just update status
-      await updatePositionClosed(position, exitDecision, currentPrice);
-    }
+    await updatePositionClosed(position, exitDecision, currentPrice);
+    logger.info({
+      module: "positions",
+      market: position.market_question?.slice(0, 50),
+      type: exitDecision.type,
+      pnl: `${exitDecision.priceDelta >= 0 ? "+" : ""}${exitDecision.priceDelta.toFixed(1)}¢`,
+    }, "Position exited");
   } catch (err) {
     logger.error({ module: "positions", err: err.message, positionId: position.id }, "Exit execution failed");
   }

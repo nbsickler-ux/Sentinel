@@ -7,7 +7,7 @@
 import { pool } from "../db/schema.js";
 import config from "../config.js";
 import logger from "../logger.js";
-import { placeLimitOrder, cancelOrder, getOrderbook } from "./polymarket.js";
+import * as kalshi from "./kalshi.js";
 import { checkCircuitBreaker } from "../risk/circuit-breaker.js";
 import { calculatePositionSize, calculateMarketMakingOrders } from "../risk/sizing.js";
 
@@ -200,17 +200,20 @@ async function executeTrade(proposal) {
     return { success: true, mode: "paper", proposal };
   }
 
-  // Real execution via CLOB
-  const side = proposal.direction === "buy_yes" ? "BUY" : "BUY"; // Buying the relevant token
-  const result = await placeLimitOrder({
-    tokenId,
+  // Real execution via Kalshi
+  const side = proposal.direction === "buy_yes" ? "yes" : "no";
+  const priceCents = Math.round(proposal.entry_price * 100);
+  const count = Math.max(1, Math.floor(proposal.size_usd / proposal.entry_price));
+
+  const result = await kalshi.placeOrder({
+    ticker: proposal.condition_id,
     side,
-    price: proposal.entry_price,
-    size: proposal.size_usd,
+    price: priceCents,
+    count,
+    type: "limit",
   });
 
-  if (result?.orderID) {
-    // Record position
+  if (result?.order_id) {
     if (pool) {
       await pool.query(
         `INSERT INTO poly_positions (
@@ -219,83 +222,18 @@ async function executeTrade(proposal) {
           kelly_fraction, order_id, status
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open')`,
         [
-          proposal.condition_id, tokenId, proposal.market_question,
+          proposal.condition_id, proposal.condition_id, proposal.market_question,
           proposal.direction, proposal.entry_price, proposal.size_usd,
           proposal.edge_cents, proposal.confidence, proposal.kelly_fraction,
-          result.orderID,
+          result.order_id,
         ]
       );
     }
 
-    return { success: true, mode: "live", orderId: result.orderID, proposal };
+    return { success: true, mode: "live", orderId: result.order_id, proposal };
   }
 
   return { success: false, reason: "Order placement failed" };
-}
-
-// ── MARKET MAKING ──
-
-/**
- * Place market-making orders around our fair value estimate.
- * Posts limit orders on both sides — earns spread + 0.20% maker rebate.
- */
-export async function placeMarketMakingOrders({
-  conditionId,
-  tokenIdYes,
-  tokenIdNo,
-  fairValue,
-  confidence,
-  bankroll,
-  sizeMultiplier = 1.0,
-}) {
-  const orders = calculateMarketMakingOrders({
-    fairValue,
-    confidence,
-    bankroll,
-    sizeMultiplier,
-  });
-
-  if (!orders.make) {
-    return { placed: false, reason: orders.reason };
-  }
-
-  const results = { bid: null, ask: null };
-
-  // Place bid (buy YES below fair value)
-  if (tokenIdYes) {
-    results.bid = await placeLimitOrder({
-      tokenId: tokenIdYes,
-      side: "BUY",
-      price: orders.bid.price,
-      size: orders.bid.size,
-    });
-  }
-
-  // Place ask (buy NO above fair value, which is equivalent to selling YES)
-  if (tokenIdNo) {
-    results.ask = await placeLimitOrder({
-      tokenId: tokenIdNo,
-      side: "BUY",
-      price: 1 - orders.ask.price, // Buy NO at complementary price
-      size: orders.ask.size,
-    });
-  }
-
-  logger.info({
-    module: "manager",
-    conditionId: conditionId?.slice(0, 12),
-    bidPrice: orders.bid.price,
-    askPrice: orders.ask.price,
-    size: `$${orders.bid.size}`,
-    spread: `${orders.spreadCents}¢`,
-  }, "Market-making orders placed");
-
-  return {
-    placed: true,
-    bid: results.bid,
-    ask: results.ask,
-    orders,
-  };
 }
 
 // ── POSITION TRACKING ──
