@@ -91,17 +91,47 @@ export async function fetchOddsForKalshiMarkets(kalshiMarkets) {
   return results;
 }
 
+// How many new markets to search per cycle (avoids 429 on first cycle)
+const SEARCH_BATCH_SIZE = 15;
+
 /**
  * For new Kalshi markets, extract team names and search odds-api.io
  * to find the matching event. Cache the mapping.
+ * Processes at most SEARCH_BATCH_SIZE per call to avoid rate limits.
  */
 async function matchNewMarkets(newMarkets) {
-  for (const market of newMarkets) {
+  // Only process a batch per cycle — the rest will get picked up next cycle
+  const batch = newMarkets.slice(0, SEARCH_BATCH_SIZE);
+  if (newMarkets.length > SEARCH_BATCH_SIZE) {
+    logger.info({
+      module: "bookmaker",
+      total: newMarkets.length,
+      processing: batch.length,
+      deferred: newMarkets.length - batch.length,
+    }, "Staggering market search — processing batch, rest deferred to next cycle");
+  }
+
+  for (const market of batch) {
     const searchTerms = extractSearchTerms(market);
     if (searchTerms.length === 0) {
       unmatchable.add(market.id);
+      logger.debug({
+        module: "bookmaker",
+        ticker: market.ticker,
+        eventTicker: market.eventTicker,
+        question: market.question?.slice(0, 80),
+        yesSub: market.yesSub?.slice(0, 60),
+      }, "No search terms extractable — marking unmatchable");
       continue;
     }
+
+    // Log what we're about to search for (diagnostic)
+    logger.info({
+      module: "bookmaker",
+      ticker: market.ticker,
+      eventTicker: market.eventTicker,
+      searchTerms,
+    }, "Searching bookmaker for Kalshi market");
 
     // Try each search term until we find a match
     let matched = false;
@@ -140,30 +170,102 @@ async function matchNewMarkets(newMarkets) {
       logger.debug({
         module: "bookmaker",
         kalshi: market.ticker,
+        eventTicker: market.eventTicker,
         question: market.question?.slice(0, 60),
         searched: searchTerms,
       }, "No bookmaker match found — skipping");
     }
+
+    // Small delay between search requests to avoid burst rate limits
+    await new Promise(r => setTimeout(r, 200));
   }
 }
 
 /**
- * Extract search terms from a Kalshi market question.
- * Tries to pull team names, player names, or other identifiers.
+ * Extract search terms from a Kalshi market.
  *
- * Examples:
- *   "Will the Lakers beat the Celtics?" → ["Lakers", "Celtics"]
- *   "NBA: Los Angeles Lakers vs Boston Celtics" → ["Lakers", "Celtics"]
- *   "Will Patrick Mahomes throw 300+ yards?" → ["Mahomes"]
+ * Kalshi markets have these useful fields:
+ *   - question: yes_sub_title || event_ticker || ticker
+ *   - yesSub: "Lakers win", "Over 220.5", "Patrick Mahomes 300+ yards"
+ *   - noSub: "Lakers lose", "Under 220.5"
+ *   - eventTicker: "KXNBA-LAL-BOS-2026APR09" or similar
+ *   - ticker: hex-like market ID (not useful for search)
+ *
+ * Strategy: try multiple sources in order of quality.
  */
 function extractSearchTerms(market) {
-  const question = market.question || market.ticker || "";
   const terms = [];
 
-  // Common team name patterns
-  // "Will the [Team] beat/win/defeat [Team]"
-  // "[Team] vs [Team]"
-  // "[Team] to win"
+  // ── Source 1: event_ticker (most reliable for sports) ──
+  // Format: "KXNBA-LAL-BOS-2026APR09" or "KXMLB-NYY-BOS-2026APR09"
+  const eventTicker = market.eventTicker || "";
+  if (eventTicker.includes("-")) {
+    const parts = eventTicker.split("-");
+    // Map common 2-3 letter team abbreviations to full names for search
+    const teamAbbrevMap = {
+      // NBA
+      LAL: "Lakers", BOS: "Celtics", GSW: "Warriors", MIL: "Bucks", PHX: "Suns",
+      DEN: "Nuggets", MIA: "Heat", NYK: "Knicks", PHI: "76ers", DAL: "Mavericks",
+      LAC: "Clippers", MEM: "Grizzlies", SAC: "Kings", CLE: "Cavaliers", ATL: "Hawks",
+      CHI: "Bulls", MIN: "Timberwolves", NOP: "Pelicans", OKC: "Thunder", IND: "Pacers",
+      TOR: "Raptors", BKN: "Nets", POR: "Blazers", ORL: "Magic", CHA: "Hornets",
+      WAS: "Wizards", SAS: "Spurs", DET: "Pistons", HOU: "Rockets", UTA: "Jazz",
+      // MLB
+      NYY: "Yankees", NYM: "Mets", BOS: "Red Sox", LAD: "Dodgers", CHC: "Cubs",
+      CHW: "White Sox", SF: "Giants", STL: "Cardinals", HOU: "Astros", ATL: "Braves",
+      PHI: "Phillies", SD: "Padres", SEA: "Mariners", TB: "Rays", TOR: "Blue Jays",
+      MIN: "Twins", CLE: "Guardians", TEX: "Rangers", BAL: "Orioles", KC: "Royals",
+      DET: "Tigers", MIL: "Brewers", CIN: "Reds", PIT: "Pirates", ARI: "Diamondbacks",
+      COL: "Rockies", MIA: "Marlins", OAK: "Athletics", WAS: "Nationals",
+      // NHL
+      BOS: "Bruins", NYR: "Rangers", NYI: "Islanders", TOR: "Maple Leafs", MTL: "Canadiens",
+      TB: "Lightning", FLA: "Panthers", CAR: "Hurricanes", NJ: "Devils", PIT: "Penguins",
+      WSH: "Capitals", PHI: "Flyers", CBJ: "Blue Jackets", DET: "Red Wings", OTT: "Senators",
+      BUF: "Sabres", EDM: "Oilers", COL: "Avalanche", DAL: "Stars", WPG: "Jets",
+      VGK: "Golden Knights", MIN: "Wild", SEA: "Kraken", LA: "Kings", ANA: "Ducks",
+      SJ: "Sharks", CGY: "Flames", VAN: "Canucks", NSH: "Predators", STL: "Blues", CHI: "Blackhawks",
+      // NFL
+      KC: "Chiefs", SF: "49ers", PHI: "Eagles", DAL: "Cowboys", BUF: "Bills",
+      BAL: "Ravens", CIN: "Bengals", MIA: "Dolphins", DET: "Lions", GB: "Packers",
+      MIN: "Vikings", LAR: "Rams", LAC: "Chargers", DEN: "Broncos", SEA: "Seahawks",
+      ARI: "Cardinals", ATL: "Falcons", TB: "Buccaneers", NO: "Saints", CAR: "Panthers",
+      WAS: "Commanders", NYG: "Giants", NYJ: "Jets", NE: "Patriots", PIT: "Steelers",
+      CLE: "Browns", HOU: "Texans", IND: "Colts", JAX: "Jaguars", TEN: "Titans", LV: "Raiders",
+    };
+
+    // Skip the sport prefix (parts[0] like "KXNBA") and date suffix
+    for (let i = 1; i < parts.length; i++) {
+      const part = parts[i].toUpperCase();
+      // Skip date-like parts (2026APR09, 20260409, etc.)
+      if (/^\d{4}/.test(part) || /^2\d{3}/.test(part)) continue;
+      // Map abbreviation to team name, or use the abbreviation itself
+      const teamName = teamAbbrevMap[part] || (part.length >= 3 ? part : null);
+      if (teamName) terms.push(teamName);
+    }
+    if (terms.length > 0) return terms;
+  }
+
+  // ── Source 2: yes_sub_title / question (outcome descriptions) ──
+  // Examples: "Lakers win", "Over 220.5", "Celtics +5.5"
+  const question = market.question || market.yesSub || "";
+  if (question.length < 3) return terms;
+
+  // Skip pure hex/numeric strings (Kalshi ticker IDs)
+  if (/^[A-F0-9]+$/i.test(question.replace(/[-_]/g, ""))) return terms;
+
+  // "Team wins" or "Team win"
+  const winMatch = question.match(/^(.+?)\s+wins?(?:\s|$)/i);
+  if (winMatch) {
+    terms.push(extractLastWord(winMatch[1]));
+    // Also check noSub for the other team
+    if (market.noSub) {
+      const noWinMatch = market.noSub.match(/^(.+?)\s+wins?(?:\s|$)/i);
+      if (noWinMatch) terms.push(extractLastWord(noWinMatch[1]));
+    }
+    return terms.filter(t => t.length >= 3);
+  }
+
+  // "[Team] vs [Team]" or "[Team] v [Team]"
   const vsMatch = question.match(/(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)(?:\?|$)/i);
   if (vsMatch) {
     terms.push(extractLastWord(vsMatch[1]));
@@ -179,23 +281,20 @@ function extractSearchTerms(market) {
     return terms.filter(t => t.length >= 3);
   }
 
-  // "[Team] to win [Championship/Game]"
+  // "[Team] to win"
   const toWinMatch = question.match(/(.+?)\s+to\s+win/i);
   if (toWinMatch) {
     terms.push(extractLastWord(toWinMatch[1]));
     return terms.filter(t => t.length >= 3);
   }
 
-  // Fallback: try the ticker which often has team abbreviations
-  // e.g. "KXNBA-LAL-BOS-2026APR09"
-  const tickerParts = (market.ticker || "").split("-");
-  if (tickerParts.length >= 3) {
-    // Try team abbreviations as search terms
-    // These are 2-3 letter codes, not great for search but worth trying
-    const abbrev1 = tickerParts[1];
-    const abbrev2 = tickerParts[2];
-    if (abbrev1 && abbrev1.length >= 2) terms.push(abbrev1);
-    if (abbrev2 && abbrev2.length >= 2) terms.push(abbrev2);
+  // "Over/Under X.X" — skip these, they're prop bets not team matchups
+  if (/^(?:over|under)\s+\d/i.test(question)) return terms;
+
+  // Last resort: try to extract any capitalized words that look like names
+  const words = question.split(/\s+/).filter(w => w.length >= 3 && /^[A-Z]/.test(w));
+  if (words.length > 0 && words.length <= 3) {
+    return words.slice(0, 2);
   }
 
   return terms.filter(t => t.length >= 3);

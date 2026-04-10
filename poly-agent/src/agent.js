@@ -62,18 +62,42 @@ async function discoverMarkets() {
   if (config.platforms?.kalshi?.enabled) {
     try {
       const markets = await kalshi.getMarkets({ status: "open", limit: 200 });
+
+      // Log a sample of raw Kalshi market objects to diagnose field availability
+      if (markets.length > 0) {
+        const sample = markets.slice(0, 3).map(m => ({
+          ticker: m.ticker,
+          event_ticker: m.event_ticker,
+          yes_sub_title: m.yes_sub_title,
+          no_sub_title: m.no_sub_title,
+          title: m.title,          // likely undefined on markets (exists on events)
+          subtitle: m.subtitle,    // likely undefined on markets
+          category: m.category,
+          status: m.status,
+        }));
+        logger.info({ module: "agent", platform: "kalshi", sample }, "Kalshi market sample (raw fields)");
+      }
+
       for (const m of markets) {
+        // Kalshi MARKETS don't have title/subtitle — those are on EVENTS.
+        // Markets have: yes_sub_title, no_sub_title, event_ticker, ticker
+        // yes_sub_title often contains team/outcome info like "Lakers win" or "Over 220.5"
+        const question = m.yes_sub_title || m.no_sub_title || m.event_ticker || m.ticker;
+
         allMarkets.push({
           id: m.ticker,
-          question: m.title || m.subtitle || m.ticker,
+          question,
           platform: "kalshi",
           sport: m.category || "unknown",
           active: m.status === "open" || m.status === "active",
-          lastYesPrice: m.yes_ask != null ? (m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask) : (m.last_price != null ? (m.last_price > 1 ? m.last_price / 100 : m.last_price) : 0.5),
-          lastNoPrice: m.no_ask != null ? (m.no_ask > 1 ? m.no_ask / 100 : m.no_ask) : 0.5,
+          lastYesPrice: m.yes_ask_dollars != null ? m.yes_ask_dollars : (m.last_price_dollars != null ? m.last_price_dollars : (m.yes_ask != null ? (m.yes_ask > 1 ? m.yes_ask / 100 : m.yes_ask) : (m.last_price != null ? (m.last_price > 1 ? m.last_price / 100 : m.last_price) : 0.5))),
+          lastNoPrice: m.no_ask_dollars != null ? m.no_ask_dollars : (m.no_ask != null ? (m.no_ask > 1 ? m.no_ask / 100 : m.no_ask) : 0.5),
           ticker: m.ticker,
-          closeTime: m.close_time || m.expiration_time,
-          volume: m.volume || 0,
+          eventTicker: m.event_ticker,  // human-readable event grouping
+          yesSub: m.yes_sub_title,      // outcome description
+          noSub: m.no_sub_title,        // opposite outcome
+          closeTime: m.close_time || m.latest_expiration_time,
+          volume: m.volume_fp || m.volume || 0,
           rawData: m,
         });
       }
