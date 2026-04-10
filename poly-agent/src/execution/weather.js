@@ -283,6 +283,63 @@ export async function fetchAllForecasts(targetDate) {
   return results;
 }
 
+// ── ACTUAL OBSERVED TEMPERATURE (for settlement) ──
+
+const OPEN_METEO_HISTORICAL_URL = "https://api.open-meteo.com/v1/forecast";
+
+/**
+ * Fetch the actual observed high temperature for a city on a given date.
+ * Uses Open-Meteo's historical/recent weather data (free, no key).
+ *
+ * @param {string} cityCode - City code (NYC, CHI, etc.)
+ * @param {string} date - YYYY-MM-DD
+ * @returns {number|null} Actual high temp in °F, or null if unavailable
+ */
+export async function fetchActualHigh(cityCode, date) {
+  const city = CITIES[cityCode];
+  if (!city) return null;
+
+  try {
+    const resp = await axios.get(OPEN_METEO_HISTORICAL_URL, {
+      params: {
+        latitude: city.lat,
+        longitude: city.lon,
+        daily: "temperature_2m_max",
+        temperature_unit: "fahrenheit",
+        start_date: date,
+        end_date: date,
+        timezone: "America/New_York",
+      },
+      timeout: 10_000,
+    });
+
+    const temps = resp.data?.daily?.temperature_2m_max;
+    if (temps && temps.length > 0 && temps[0] != null) {
+      logger.info({
+        module: "weather",
+        city: city.name,
+        date,
+        actualHigh: temps[0],
+      }, "Actual high temperature fetched");
+      return temps[0];
+    }
+    return null;
+  } catch (err) {
+    logger.error({ module: "weather", city: city.name, date, err: err.message }, "Failed to fetch actual high");
+    return null;
+  }
+}
+
+/**
+ * Get yesterday's date in YYYY-MM-DD format (ET timezone).
+ */
+export function getYesterdayDateET() {
+  const now = new Date();
+  const etDate = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  etDate.setDate(etDate.getDate() - 1);
+  return etDate.toISOString().split("T")[0];
+}
+
 /**
  * Get tomorrow's date in YYYY-MM-DD format (ET timezone).
  */

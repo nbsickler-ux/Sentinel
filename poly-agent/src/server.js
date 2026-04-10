@@ -18,6 +18,7 @@ import {
   getOpenPositions,
 } from "./execution/manager.js";
 import { getPerformanceSummary } from "./execution/positions.js";
+import { getCalibrationReport, recordSettlement, initCalibrationTable } from "./analysis/calibration.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -135,6 +136,23 @@ app.get("/api/performance", async (_req, res) => {
   res.json(summary || { message: "No closed positions yet" });
 });
 
+// ── CALIBRATION ──
+
+app.get("/api/calibration", async (req, res) => {
+  const days = parseInt(req.query.days) || 30;
+  const report = await getCalibrationReport({ days });
+  res.json(report || { message: "No calibration data yet" });
+});
+
+app.post("/api/calibration/settle", async (req, res) => {
+  const { cityCode, targetDate, actualHigh } = req.body;
+  if (!cityCode || !targetDate || actualHigh == null) {
+    return res.status(400).json({ error: "Missing cityCode, targetDate, or actualHigh" });
+  }
+  await recordSettlement(cityCode, targetDate, actualHigh);
+  res.json({ success: true, cityCode, targetDate, actualHigh });
+});
+
 // ── BANKROLL MANAGEMENT ──
 
 app.post("/api/bankroll/deposit", async (req, res) => {
@@ -236,6 +254,9 @@ async function boot() {
 
   // Initialize database
   await initializeDatabase();
+
+  // Initialize weather calibration table (after main schema)
+  await initCalibrationTable();
 
   // Initialize Kalshi client
   initKalshi();

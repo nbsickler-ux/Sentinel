@@ -27,13 +27,16 @@ import * as kalshi from "./execution/kalshi.js";
 import {
   CITIES,
   fetchAllForecasts,
+  fetchActualHigh,
   parseBracketFromTitle,
   getTomorrowDateET,
   getTodayDateET,
+  getYesterdayDateET,
 } from "./execution/weather.js";
 import { findWeatherEdges, summarizeEdges } from "./analysis/edge.js";
 import { checkCircuitBreaker } from "./risk/circuit-breaker.js";
 import { createProposal, approveProposal } from "./execution/manager.js";
+import { recordPrediction, recordSettlement } from "./analysis/calibration.js";
 import { pool } from "./db/schema.js";
 
 // ── STATE ──
@@ -263,7 +266,7 @@ async function edgeScanCycle() {
       await actOnEdge(edge);
     }
 
-    // Log all edges for calibration
+    // Log all edges for calibration tracking
     for (const edge of edges) {
       state.tradeLog.push({
         timestamp: Date.now(),
@@ -271,6 +274,22 @@ async function edgeScanCycle() {
         ...edge,
         executed: false,
       });
+
+      // Record every prediction for Brier score calibration
+      recordPrediction({
+        ticker: edge.ticker,
+        cityCode: edge.cityCode,
+        bracketLabel: edge.bracketLabel,
+        bracketLow: edge.bracket?.low ?? null,
+        bracketHigh: edge.bracket?.high ?? null,
+        modelProb: edge.modelProb,
+        marketPrice: edge.marketPrice,
+        ensembleMembers: edge.ensembleMembers,
+        side: edge.side,
+        netEdgeCents: edge.netEdgeCents,
+        traded: edge.tradeEligible && config.mode !== "analysis",
+        targetDate: getTomorrowDateET(),
+      }).catch(() => {}); // fire-and-forget
     }
   } else {
     logger.info({ module: "agent", markets: state.weatherMarkets.length }, "No edges found this cycle");
@@ -377,18 +396,59 @@ async function actOnEdge(edge) {
   }
 }
 
+// ── SETTLEMENT CHECK ──
+
+/**
+ * Check if yesterday's markets have settled by fetching actual high temps.
+ * Runs once per day — checks at first tick after 6 PM ET (temps are finalized).
+ */
+let lastSettlementCheck = null;
+
+async function checkSettlements() {
+  const today = getTodayDateET();
+  if (lastSettlementCheck === today) return; // Already checked today
+
+  // Only check after 6 PM ET (NWS daily highs are finalized)
+  const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  if (etNow.getHours() < 18) return;
+
+  lastSettlementCheck = today;
+  const yesterday = getYesterdayDateET();
+
+  logger.info({ module: "agent", settlingDate: yesterday }, "Running daily settlement check");
+
+  for (const cityCode of Object.keys(CITIES)) {
+    try {
+      const actualHigh = await fetchActualHigh(cityCode, yesterday);
+      if (actualHigh != null) {
+        await recordSettlement(cityCode, yesterday, actualHigh);
+        logger.info({
+          module: "agent",
+          cityCode,
+          date: yesterday,
+          actualHigh,
+        }, "Settlement recorded from observed data");
+      }
+    } catch (err) {
+      logger.error({ module: "agent", cityCode, err: err.message }, "Settlement check failed");
+    }
+  }
+}
+
 // ── MAIN LOOP ──
 
 async function tick() {
   state.cycleCount++;
   try {
-    // Three phases per tick:
+    // Four phases per tick:
     // 1. Discover/refresh temperature markets (every 5 min)
     // 2. Fetch/refresh ensemble forecasts (every 5 min)
     // 3. Scan for edges and execute (every 60s)
+    // 4. Check settlements (once daily after 6 PM ET)
     await discoverWeatherMarkets();
     await fetchForecasts();
     await edgeScanCycle();
+    await checkSettlements();
   } catch (err) {
     logger.error({ module: "agent", err: err.message, stack: err.stack }, "Tick error");
   }
