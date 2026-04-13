@@ -99,14 +99,18 @@ app.use(express.urlencoded({ extended: true }));  // Catch form-encoded POSTs (c
 
 // ── Body rescue middleware ──
 // If Content-Type is missing or wrong (e.g. text/plain), express.json() silently
-// leaves req.body as undefined. This middleware attempts to parse it as JSON so
-// callers with misconfigured headers still get served.
+// leaves req.body as undefined. This catch-all reads the raw body and attempts
+// to parse it as JSON so callers with misconfigured headers still get served.
+app.use(express.raw({ type: () => true, limit: "1mb" }));
 app.use((req, res, next) => {
-  if (req.method === "POST" && (!req.body || (typeof req.body === "object" && Object.keys(req.body).length === 0))) {
-    // req.body is empty — check if there's a raw body we can rescue
-    // express.json() already consumed the stream, but urlencoded may have caught it.
-    // If neither parser caught it, there's nothing more we can do here.
-    // The normalization middleware downstream will handle missing fields gracefully.
+  if (Buffer.isBuffer(req.body)) {
+    const text = req.body.toString("utf8").trim();
+    if (text.length > 0) {
+      try { req.body = JSON.parse(text); }
+      catch { req.body = {}; }
+    } else {
+      req.body = {};
+    }
   }
   next();
 });
@@ -1579,7 +1583,7 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
 // instead of getting a 400 they can't diagnose.
 //
 // Field aliases resolved:
-//   address  ← tokenAddress, contractAddress, contract, token_address, token (when string & looks like address)
+//   address  ← tokenAddress, contractAddress, contract, token_address, contract_address, token, addr
 //   protocol ← protocolAddress, pool, vault, pool_address, vault_address
 //   target   ← targetAddress, target_address, contract (on /preflight)
 //
@@ -1588,7 +1592,7 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
 //   - Prepend "0x" if caller sent 40 hex chars without prefix
 //   - Strip whitespace from address values
 
-const ADDRESS_ALIASES = ["tokenAddress", "contractAddress", "contract", "token_address", "contract_address"];
+const ADDRESS_ALIASES = ["tokenAddress", "contractAddress", "contract", "token_address", "contract_address", "token", "addr"];
 const PROTOCOL_ALIASES = ["protocolAddress", "pool", "vault", "pool_address", "vault_address"];
 const TARGET_ALIASES = ["targetAddress", "target_address"];
 
@@ -1619,16 +1623,21 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
   const body = req.body || {};
   const query = req.query || {};
 
+  // NOTE: app.use(path, handler) strips the mount path from req.path,
+  // so req.path is "/" inside this middleware. Use req.baseUrl to get
+  // the original matched path (e.g. "/verify/token").
+  const endpoint = req.baseUrl;
+
   // === Field alias resolution ===
-  if (req.path === "/verify/token" || req.path === "/verify/protocol" || req.path === "/verify/counterparty") {
+  if (endpoint === "/verify/token" || endpoint === "/verify/protocol" || endpoint === "/verify/counterparty") {
     resolveAlias(body, "address", ADDRESS_ALIASES);
     resolveAlias(query, "address", ADDRESS_ALIASES);
   }
-  if (req.path === "/verify/position") {
+  if (endpoint === "/verify/position") {
     resolveAlias(body, "protocol", PROTOCOL_ALIASES);
     resolveAlias(query, "protocol", PROTOCOL_ALIASES);
   }
-  if (req.path === "/preflight") {
+  if (endpoint === "/preflight") {
     resolveAlias(body, "target", TARGET_ALIASES);
     resolveAlias(query, "target", TARGET_ALIASES);
     // On preflight, "contract" or "address" likely means "target"
@@ -1671,9 +1680,10 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
         ? receivedAddress.substring(0, 20) + (receivedAddress.length > 20 ? "…" : "")
         : receivedAddress;
 
+      const endpoint = req.baseUrl || req.path;
       logger.warn({
         event: "validation_failure",
-        path: req.path,
+        path: endpoint,
         method: req.method,
         ip: req.ip,
         content_type: contentType,
@@ -1684,7 +1694,7 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
         received_address_length: typeof receivedAddress === "string" ? receivedAddress.length : null,
         resolved_from: params._resolved_from || null,
         user_agent: (req.headers["user-agent"] || "").substring(0, 100),
-      }, `400 validation failure on ${req.path} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}`);
+      }, `400 validation failure on ${endpoint} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}`);
     }
     return originalJson(body);
   };
