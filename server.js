@@ -105,6 +105,8 @@ app.use(express.raw({ type: () => true, limit: "1mb" }));
 app.use((req, res, next) => {
   if (Buffer.isBuffer(req.body)) {
     const text = req.body.toString("utf8").trim();
+    req._rawBody = text || "(empty)";           // Diagnostic: stash raw bytes before parsing
+    req._rawBodyLength = text.length;            // Diagnostic: original byte length
     if (text.length > 0) {
       try { req.body = JSON.parse(text); }
       catch { req.body = {}; }
@@ -1592,7 +1594,15 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
 //   - Prepend "0x" if caller sent 40 hex chars without prefix
 //   - Strip whitespace from address values
 
-const ADDRESS_ALIASES = ["tokenAddress", "contractAddress", "contract", "token_address", "contract_address", "token", "addr"];
+const ADDRESS_ALIASES = [
+  "tokenAddress", "contractAddress", "contract", "token_address", "contract_address", "token", "addr",
+  // x402 ecosystem expansions
+  "wallet", "walletAddress", "wallet_address",
+  "recipient", "recipient_address", "recipientAddress",
+  "to", "toAddress", "to_address",
+  "account", "payee",
+  "pubkey", "publicKey", "public_key",
+];
 const PROTOCOL_ALIASES = ["protocolAddress", "pool", "vault", "pool_address", "vault_address"];
 const TARGET_ALIASES = ["targetAddress", "target_address"];
 
@@ -1612,6 +1622,16 @@ function resolveAlias(params, canonicalKey, aliases) {
     if (params[alias] !== undefined) {
       params[canonicalKey] = params[alias];
       params._resolved_from = alias;  // breadcrumb for diagnostic logging
+      return;
+    }
+  }
+  // Case-insensitive fallback: check all body keys against aliases
+  const lowerAliases = new Set([canonicalKey, ...aliases].map(a => a.toLowerCase()));
+  for (const key of Object.keys(params)) {
+    if (key === "_resolved_from") continue;
+    if (lowerAliases.has(key.toLowerCase()) && params[key] !== undefined) {
+      params[canonicalKey] = params[key];
+      params._resolved_from = `${key} (case-insensitive)`;
       return;
     }
   }
@@ -1687,19 +1707,33 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
         method: req.method,
         ip: req.ip,
         content_type: contentType,
+        content_length: req.headers["content-length"] || "(missing)",
         body_keys: bodyKeys,
         query_keys: queryKeys,
+        raw_body_preview: (req._rawBody || "(no raw capture)").substring(0, 200),
+        raw_body_length: req._rawBodyLength ?? null,
         received_address: truncated,
         received_address_type: typeof receivedAddress,
         received_address_length: typeof receivedAddress === "string" ? receivedAddress.length : null,
         resolved_from: params._resolved_from || null,
         user_agent: (req.headers["user-agent"] || "").substring(0, 100),
-      }, `400 validation failure on ${endpoint} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}`);
+      }, `400 validation failure on ${endpoint} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}, raw_length: ${req._rawBodyLength ?? "n/a"}`);
     }
     return originalJson(body);
   };
 
   next();
+});
+
+
+// ── HEAD request handler ──
+// x402 agents commonly send HEAD to probe endpoint availability before POSTing.
+// Return 200 so they know the endpoint is live, instead of 400 (which signals "broken").
+app.head(NORMALIZE_PATHS, (req, res) => {
+  res.set("Content-Type", "application/json");
+  res.set("Allow", "GET, POST, HEAD, OPTIONS");
+  res.set("X-Sentinel-Hint", "Use POST with JSON body {\"address\": \"0x...\"} for verification");
+  return res.status(200).end();
 });
 
 
