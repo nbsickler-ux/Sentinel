@@ -345,6 +345,18 @@ npm run dev
 | `SENTINEL_ADMIN_KEY` | No | Enables `/admin/stats` endpoint |
 | `LOG_LEVEL` | No | Pino log level (default: `info`) |
 
+## Admin Audit Report
+
+With `SENTINEL_ADMIN_KEY` set in `.env`, run the helper script for a pretty-printed report of calls made to Sentinel:
+
+```bash
+./scripts/audit-report.sh            # /admin/stats (default)
+./scripts/audit-report.sh audit      # full audit trail
+./scripts/audit-report.sh summary    # aggregated summary
+```
+
+The script loads the key from `.env` (gitignored) and scopes it to the curl invocation only.
+
 ## Rate Limiting
 
 Free tier: 25 calls per wallet address per day (sliding window). Rate limit headers are included on every response:

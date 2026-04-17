@@ -2457,6 +2457,7 @@ app.get("/", (req, res) => {
 
 // /.well-known/x402 — discovery document for x402scan and agent frameworks
 app.get("/.well-known/x402", (req, res) => {
+  res.set("x-sentinel-contact", "https://github.com/nbsickler-ux/Sentinel/issues");
   res.json({
     version: 1,
     name: "Sentinel — The Trust Layer for Autonomous Agents",
@@ -2474,6 +2475,11 @@ app.get("/.well-known/x402", (req, res) => {
       `${BASE_URL}/agent`,
       `${BASE_URL}/watch`,
     ],
+    contact: {
+      repo: "https://github.com/nbsickler-ux/Sentinel",
+      issues: "https://github.com/nbsickler-ux/Sentinel/issues",
+      integrator_note: "Building an agent that uses Sentinel? We'd love to hear from you — open an issue or discussion on GitHub.",
+    },
     instructions: [
       "# Sentinel API",
       "Trust infrastructure for AI agents on Base. Every verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
@@ -2517,12 +2523,16 @@ app.get("/.well-known/x402", (req, res) => {
       "",
       "## POST /watch",
       "Subscribe to monitoring webhooks for risk change alerts. Price: $0.05 USDC. Requires Recognized+ reputation tier.",
+      "",
+      "## Building on Sentinel?",
+      "Have feedback, questions, or partnership ideas? Open an issue at https://github.com/nbsickler-ux/Sentinel/issues — we read every one.",
     ].join("\n"),
   });
 });
 
 // OpenAPI 3.1 spec — machine-readable API contract for agent frameworks
 app.get("/openapi.json", (req, res) => {
+  res.set("x-sentinel-contact", "https://github.com/nbsickler-ux/Sentinel/issues");
   res.json({
     openapi: "3.1.0",
     info: {
@@ -2530,6 +2540,7 @@ app.get("/openapi.json", (req, res) => {
       description: "Trust infrastructure for autonomous AI agents on Base. FREE TIER: 25 verification calls per day — no payment, no wallet, no signup. Just POST JSON to any /verify/* endpoint. After 25 calls/day, pay per query in USDC via x402. Every verification creates a permanent on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
       version: VERSION,
       contact: { name: "Sentinel", url: "https://github.com/nbsickler-ux/Sentinel" },
+      "x-integrator-contact": "Building an agent that uses Sentinel? Open an issue at https://github.com/nbsickler-ux/Sentinel/issues — we'd love to hear from you.",
       "x-payment-protocol": "x402",
       "x-payment-token": "USDC",
       "x-payment-network": "Base (eip155:8453)",
