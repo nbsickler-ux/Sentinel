@@ -94,7 +94,19 @@ try {
 
 const app = express();
 app.set("trust proxy", true);   // Render (and most PaaS) sit behind a reverse proxy — trust X-Forwarded-Proto so req.protocol is "https"
-app.use(express.json());
+// express.json() with a verify hook that stashes the raw bytes BEFORE parsing.
+// This lets the body-parse error handler below recover the original payload
+// when JSON.parse fails (single quotes, trailing commas, Python-style True/False,
+// unquoted keys — all common from AI-agent JSON serializers).
+app.use(express.json({
+  limit: "1mb",
+  verify: (req, _res, buf) => {
+    try {
+      req._rawBody = buf.toString("utf8");
+      req._rawBodyLength = buf.length;
+    } catch { /* ignore */ }
+  },
+}));
 app.use(express.urlencoded({ extended: true }));  // Catch form-encoded POSTs (common misconfiguration)
 
 // ── Body rescue middleware ──
@@ -115,6 +127,44 @@ app.use((req, res, next) => {
     }
   }
   next();
+});
+
+// ── JSON parse error handler (Express error-handling middleware: 4 args) ──
+// When a caller sends Content-Type: application/json with MALFORMED JSON,
+// express.json() throws a SyntaxError with `type === "entity.parse.failed"`.
+// Without this handler Express returns its default 400 HTML page containing a
+// raw stack trace — opaque to AI agents and not actionable. We catch the error,
+// set req.body = {} so the route handlers run and emit their endpoint-specific
+// JSON 400 with the helpful example_request payload. The verify hook above has
+// already preserved the raw bytes on req._rawBody for diagnostic logging.
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  const isBodyParseError =
+    err.type === "entity.parse.failed" ||
+    err.type === "entity.too.large" ||
+    err.type === "encoding.unsupported" ||
+    err.type === "charset.unsupported" ||
+    (err instanceof SyntaxError && err.status === 400 && "body" in err);
+  if (!isBodyParseError) return next(err);
+
+  req._jsonParseFailed = true;
+  req._jsonParseError = err.message;
+  req.body = {};
+
+  // If this is a verification path, fall through to the route handler —
+  // its existing 400 includes an example_request the agent can copy-paste.
+  const VERIFICATION_PATHS = new Set([
+    "/verify/protocol","/verify/token","/verify/position","/verify/counterparty","/preflight",
+  ]);
+  if (VERIFICATION_PATHS.has(req.path)) return next();
+
+  // Non-verification path: emit a generic JSON 400 right here.
+  return res.status(400).json({
+    error: "Could not parse request body as JSON: " + err.message,
+    hint: "Check your JSON syntax (matched quotes, no trailing commas, keys in double quotes) and that Content-Type is exactly 'application/json'.",
+    received_content_type: req.headers["content-type"] || "(missing)",
+    received_body_preview: (req._rawBody || "").substring(0, 200) || "(unavailable)",
+  });
 });
 
 // Add pino-http middleware for automatic request logging
@@ -1565,6 +1615,8 @@ function writeAuditPostResponse(req, { payerWallet, tier, endpoint, target, chai
     x402_payment_verified: true,
     data_sources_used: dataSources,
     degraded_sources: (result.risk_flags || []).includes("OFAC_SCREENING_UNAVAILABLE") ? ["ofac"] : [],
+    referrer: req.headers["referer"] || req.headers["referrer"] || null,
+    user_agent: req.headers["user-agent"] || null,
   });
 }
 
@@ -1656,6 +1708,13 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
   if (endpoint === "/verify/position") {
     resolveAlias(body, "protocol", PROTOCOL_ALIASES);
     resolveAlias(query, "protocol", PROTOCOL_ALIASES);
+    // Many agents naturally call the canonical field "address" on a position
+    // endpoint. If neither `protocol` nor a protocol alias was found, fall back
+    // to treating `address`/`contract`/`contractAddress` as the protocol.
+    if (!body.protocol && !query.protocol) {
+      resolveAlias(body, "protocol", [...PROTOCOL_ALIASES, "address", "contract", "contractAddress", "addr", "tokenAddress", "token_address"]);
+      resolveAlias(query, "protocol", [...PROTOCOL_ALIASES, "address", "contract", "contractAddress", "addr", "tokenAddress", "token_address"]);
+    }
   }
   if (endpoint === "/preflight") {
     resolveAlias(body, "target", TARGET_ALIASES);
@@ -1687,8 +1746,22 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
   const originalJson = res.json.bind(res);
 
   res.json = function(body) {
-    // Only log on 400 responses to verification endpoints
+    // Only act on 400 responses to verification endpoints
     if (res.statusCode === 400) {
+      // ── Inject body-parse error context into the response so callers see WHY ──
+      // If express.json() threw on malformed JSON, the route handler thinks the
+      // body was simply empty (because we set req.body = {} in the error handler).
+      // Surface the real reason so the agent can fix its serializer.
+      if (req._jsonParseFailed && body && typeof body === "object") {
+        body = {
+          ...body,
+          body_parse_error: req._jsonParseError || "Could not parse request body as JSON.",
+          received_content_type: req.headers["content-type"] || "(missing)",
+          received_body_preview: (req._rawBody || "").substring(0, 200) || "(unavailable)",
+          hint: body.hint || "Your Content-Type was 'application/json' but the body could not be parsed. Check for unmatched quotes, trailing commas, single-quoted keys, or non-JSON literals like Python True/False/None.",
+        };
+      }
+
       const contentType = req.headers["content-type"] || "(missing)";
       const bodyKeys = req.body ? Object.keys(req.body) : [];
       const queryKeys = req.query ? Object.keys(req.query) : [];
@@ -1712,12 +1785,14 @@ app.use(NORMALIZE_PATHS, (req, res, next) => {
         query_keys: queryKeys,
         raw_body_preview: (req._rawBody || "(no raw capture)").substring(0, 200),
         raw_body_length: req._rawBodyLength ?? null,
+        json_parse_failed: !!req._jsonParseFailed,
+        json_parse_error: req._jsonParseError || null,
         received_address: truncated,
         received_address_type: typeof receivedAddress,
         received_address_length: typeof receivedAddress === "string" ? receivedAddress.length : null,
         resolved_from: params._resolved_from || null,
         user_agent: (req.headers["user-agent"] || "").substring(0, 100),
-      }, `400 validation failure on ${endpoint} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}, raw_length: ${req._rawBodyLength ?? "n/a"}`);
+      }, `400 validation failure on ${endpoint} — caller sent ${bodyKeys.length ? "body keys: [" + bodyKeys.join(",") + "]" : "empty body"}, content-type: ${contentType}, raw_length: ${req._rawBodyLength ?? "n/a"}${req._jsonParseFailed ? ", json_parse_failed=true" : ""}`);
     }
     return originalJson(body);
   };
@@ -2545,7 +2620,8 @@ app.get("/openapi.json", (req, res) => {
       "x-payment-token": "USDC",
       "x-payment-network": "Base (eip155:8453)",
       "x-free-tier": "25 calls/day per IP — no payment required. Check X-FreeTier-Remaining response header.",
-      "x-guidance": "Sentinel is trust infrastructure for autonomous AI agents on Base. FREE TIER: All /verify/* and /preflight endpoints allow 25 free calls per day with no payment required — just send a POST with a JSON body. After the free quota, x402 USDC payment is required. Always-free endpoints: GET /attestation/:address (check existing trust records), GET /agent/:wallet (reputation lookup), GET /, GET /health, GET /openapi.json. Every verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
+      "x-required-headers": { "Content-Type": "application/json — REQUIRED for all POST endpoints. Without it, the body is treated as raw bytes and may not parse." },
+      "x-guidance": "Sentinel is trust infrastructure for autonomous AI agents on Base. FREE TIER: All /verify/* and /preflight endpoints allow 25 free calls per day with no payment required — just send a POST with a JSON body AND the header 'Content-Type: application/json'. After the free quota, x402 USDC payment is required. Always-free endpoints: GET /attestation/:address (check existing trust records), GET /agent/:wallet (reputation lookup), GET /, GET /health, GET /openapi.json. Every verification creates an on-chain EAS attestation. Returning agents earn reputation tiers for faster service.",
     },
     servers: [{ url: "https://sentinel-awms.onrender.com", description: "Production (Base mainnet)" }],
     paths: {
@@ -2553,8 +2629,9 @@ app.get("/openapi.json", (req, res) => {
         post: {
           operationId: "verifyProtocol",
           summary: "Assess smart contract trustworthiness",
-          description: "Evaluates a smart contract's audit status, TVL, on-chain age, open-source verification, and protocol registry presence. Returns a composite trust score with verdict and grade.",
+          description: "Evaluates a smart contract's audit status, TVL, on-chain age, open-source verification, and protocol registry presence. Returns a composite trust score with verdict and grade. REQUIRES header: Content-Type: application/json.",
           tags: ["Verification"],
+          parameters: [{ $ref: "#/components/parameters/ContentTypeJson" }],
           "x-payment-info": { price: { mode: "fixed", currency: "USDC", amount: "0.008" }, protocols: [{ "x402": {} }] },
           requestBody: {
             required: true,
@@ -2586,8 +2663,9 @@ app.get("/openapi.json", (req, res) => {
         post: {
           operationId: "verifyToken",
           summary: "Check token legitimacy and safety",
-          description: "Detects honeypots, fake tokens, tax manipulation, rugpull patterns, and ownership risks. Uses GoPlus Security API for comprehensive token analysis.",
+          description: "Detects honeypots, fake tokens, tax manipulation, rugpull patterns, and ownership risks. Uses GoPlus Security API for comprehensive token analysis. REQUIRES header: Content-Type: application/json.",
           tags: ["Verification"],
+          parameters: [{ $ref: "#/components/parameters/ContentTypeJson" }],
           "x-payment-info": { price: { mode: "fixed", currency: "USDC", amount: "0.005" }, protocols: [{ "x402": {} }] },
           requestBody: {
             required: true,
@@ -2619,8 +2697,9 @@ app.get("/openapi.json", (req, res) => {
         post: {
           operationId: "verifyPosition",
           summary: "Analyze DeFi position risk",
-          description: "Evaluates liquidity depth, impermanent loss risk, pool concentration, and utilization rate for DeFi positions.",
+          description: "Evaluates liquidity depth, impermanent loss risk, pool concentration, and utilization rate for DeFi positions. REQUIRES header: Content-Type: application/json. The protocol field accepts the aliases: protocolAddress, pool, vault, pool_address, vault_address, address, contract, contractAddress.",
           tags: ["Verification"],
+          parameters: [{ $ref: "#/components/parameters/ContentTypeJson" }],
           "x-payment-info": { price: { mode: "fixed", currency: "USDC", amount: "0.005" }, protocols: [{ "x402": {} }] },
           requestBody: {
             required: true,
@@ -2653,8 +2732,9 @@ app.get("/openapi.json", (req, res) => {
         post: {
           operationId: "verifyCounterparty",
           summary: "Assess counterparty wallet safety",
-          description: "Checks OFAC sanctions list, contract verification status, wallet age, transaction patterns, and activity signals. OFAC hits are hard blockers that override all other scores.",
+          description: "Checks OFAC sanctions list, contract verification status, wallet age, transaction patterns, and activity signals. OFAC hits are hard blockers that override all other scores. REQUIRES header: Content-Type: application/json.",
           tags: ["Verification"],
+          parameters: [{ $ref: "#/components/parameters/ContentTypeJson" }],
           "x-payment-info": { price: { mode: "fixed", currency: "USDC", amount: "0.010" }, protocols: [{ "x402": {} }] },
           requestBody: {
             required: true,
@@ -2686,8 +2766,9 @@ app.get("/openapi.json", (req, res) => {
         post: {
           operationId: "preflight",
           summary: "Unified pre-transaction safety check",
-          description: "Runs protocol, token, position, and counterparty checks in parallel. Computes a weighted composite score (protocol 35%, position 25%, token 20%, counterparty 20%) with dynamic normalization for missing checks. OFAC sanctions and honeypot detections are hard blockers. Returns a single proceed/do-not-proceed recommendation.",
+          description: "Runs protocol, token, position, and counterparty checks in parallel. Computes a weighted composite score (protocol 35%, position 25%, token 20%, counterparty 20%) with dynamic normalization for missing checks. OFAC sanctions and honeypot detections are hard blockers. Returns a single proceed/do-not-proceed recommendation. REQUIRES header: Content-Type: application/json.",
           tags: ["Verification"],
+          parameters: [{ $ref: "#/components/parameters/ContentTypeJson" }],
           "x-payment-info": { price: { mode: "fixed", currency: "USDC", amount: "0.025" }, protocols: [{ "x402": {} }] },
           requestBody: {
             required: true,
@@ -2720,8 +2801,25 @@ app.get("/openapi.json", (req, res) => {
     },
     components: {
       schemas: {
-        TrustVerdict: { type: "string", enum: ["SAFE", "MODERATE", "CAUTION", "DANGER"], description: "Overall risk assessment" },
-        Grade: { type: "string", enum: ["A+", "A", "B+", "B", "C+", "C", "D", "F"], description: "Letter grade mapped from numeric score" },
+        // Verdict values match what the handlers actually emit (see lib/scoring.js gradeFromScore)
+        TrustVerdict: { type: "string", enum: ["SAFE", "LOW_RISK", "CAUTION", "HIGH_RISK", "DANGER"], description: "Overall risk assessment" },
+        // Grade values match what gradeFromScore actually returns: A, B, C, D, F (no +/- variants today)
+        Grade: { type: "string", enum: ["A", "B", "C", "D", "F"], description: "Letter grade mapped from numeric score" },
+      },
+      parameters: {
+        // Reusable header parameter — explicitly declared so schema readers that parse
+        // `parameters` independently of `requestBody.content` (some lower-end agent
+        // generators do) still set the Content-Type header. OpenAPI clients should
+        // already set this from requestBody.content["application/json"], but this is
+        // belt-and-braces.
+        ContentTypeJson: {
+          name: "Content-Type",
+          in: "header",
+          required: true,
+          schema: { type: "string", enum: ["application/json"] },
+          description: "MUST be exactly 'application/json'. Without it the body cannot be parsed and the request will return 400 with a malformed-payload error.",
+          example: "application/json",
+        },
       },
     },
   });
